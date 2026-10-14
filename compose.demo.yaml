@@ -1,0 +1,60 @@
+# Local demo override (use through scripts/demo.sh, which also loads demo/demo.env, the Phase 2 file
+# and a separate project name). Adds the two things production already has:
+#   apache    stands in for the site's reverse proxy; runs apache/remote-browser.conf (the production
+#             vhost file) plus the portal of
+#   authelia  a demo Authelia with dummy users from demo/users.yml instead of FreeIPA.
+# Topology as in production: client -> apache:PUBLIC_PORT -> nginx (HTTPS) -> browser; nginx -> authelia.
+
+services:
+  apache:
+    image: httpd:2.4.69-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PUBLIC_PORT:?}:443"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      AUTHELIA_HOST: ${AUTHELIA_HOST}
+    volumes:
+      - ./demo/apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./apache/remote-browser.conf:/usr/local/apache2/conf/remote-browser.conf:ro
+      - ${TLS_DIR}:/tls:ro
+    networks:
+      frontend:
+        # TRUSTED_PROXY in demo/demo.env.
+        ipv4_address: 10.214.0.10
+    depends_on:
+      - nginx
+      - authelia
+
+  authelia:
+    image: authelia/authelia:4.39.28
+    restart: unless-stopped
+    expose:
+      - "9091"
+    environment:
+      TZ: ${TZ:-UTC}
+      X_AUTHELIA_CONFIG_FILTERS: template
+      # No AUTHELIA_ prefix: Authelia reads every AUTHELIA_* variable as a configuration key.
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      PORTAL_HOST: ${AUTHELIA_HOST}
+      PUBLIC_PORT: ${PUBLIC_PORT}
+      FREEIPA_BROWSER_GROUP: ${FREEIPA_BROWSER_GROUP:-remote-browser-users}
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/authelia_session_secret
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/authelia_storage_encryption_key
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/authelia_reset_password_jwt_secret
+    volumes:
+      - ./demo/authelia/configuration.yml:/config/configuration.yml:ro
+      - ./demo/users.yml:/config/users.yml:ro
+      - ${AUTHELIA_DATA_DIR:?}:/data
+      - ${SECRETS_DIR:?}:/secrets:ro
+    networks:
+      - frontend
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # Fixed so that the Apache address (TRUSTED_PROXY) is known.
+  frontend:
+    ipam:
+      config:
+        - subnet: 10.214.0.0/24

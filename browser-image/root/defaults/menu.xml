@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Right-click menu of the session: the two browsers only (no terminal, no file manager). -->
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="Remote browser">
+    <item label="Google Chrome"><action name="Execute"><command>/usr/bin/google-chrome-stable --start-maximized --password-store=basic --no-first-run --no-default-browser-check</command></action></item>
+    <item label="Mozilla Firefox"><action name="Execute"><command>/usr/bin/firefox</command></action></item>
+  </menu>
+</openbox_menu>

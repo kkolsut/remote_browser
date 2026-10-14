@@ -1,0 +1,4 @@
+#!/bin/bash
+# Started by openbox for the session user. Keep it in the foreground (no exec, no &): the
+# RESTART_APP watchdog restarts this script when its process disappears.
+/usr/local/bin/browser-launcher

@@ -1,0 +1,121 @@
+# Rendered by the nginx image entrypoint (envsubst) into /etc/nginx/conf.d/remote-browser.conf.
+# Only variables listed in NGINX_ENVSUBST_FILTER (compose.yaml) are substituted; nginx's own
+# $variables are left untouched.
+#
+# This Nginx sits behind the site's reverse proxy (Apache), which terminates public TLS and forwards
+# PUBLIC_HOST here over HTTPS. Authentication is the site's Authelia (AUTHELIA_AUTHZ_URL).
+
+# Port part of public https:// URLs: empty on 443.
+map "${PUBLIC_PORT}" $public_port {
+    "443"   "";
+    default ":${PUBLIC_PORT}";
+}
+
+# --- Client address -----------------------------------------------------------------------------------
+# Only the reverse proxy connects. It appends the client address to X-Forwarded-For; with
+# real_ip_recursive off, Nginx takes that last entry, so a client-supplied X-Forwarded-For is ignored.
+set_real_ip_from ${TRUSTED_PROXY};
+real_ip_header   X-Forwarded-For;
+
+# The connecting address ($realip_remote_addr), not the client address: is it the reverse proxy?
+geo $realip_remote_addr $from_trusted_proxy {
+    default 0;
+    ${TRUSTED_PROXY} 1;
+}
+
+# --- Unknown TLS names: refuse the handshake. --------------------------------------------------------
+server {
+    listen 443 ssl default_server;
+    ssl_reject_handshake on;
+}
+
+# --- Protected service. ------------------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    server_name ${PUBLIC_HOST};
+    include /etc/nginx/snippets/tls.conf;
+
+    # Overwritten by auth_request_set after a successful authorization.
+    set $auth_user   "";
+    set $auth_groups "";
+    set $auth_name   "";
+    set $auth_email  "";
+
+    # Anyone but the reverse proxy (e.g. a browser container, or a host bypassing Apache): close the
+    # connection without a response.
+    if ($from_trusted_proxy = 0) {
+        return 444;
+    }
+
+    # Authelia's authz endpoint (an endpoint restricted to session cookies, see docs/apache-authelia.md).
+    # With https://, the certificate is verified against AUTHELIA_CA_FILE: whoever answers this
+    # request decides the identity (Remote-User).
+    set $upstream_authelia ${AUTHELIA_AUTHZ_URL};
+    proxy_ssl_server_name         on;
+    proxy_ssl_verify              on;
+    proxy_ssl_verify_depth        3;
+    proxy_ssl_trusted_certificate ${AUTHELIA_CA_FILE};
+    include /etc/nginx/snippets/authelia-location.conf;
+
+    location ^~ /_errors/ {
+        internal;
+        alias /usr/share/nginx/remote-browser/;
+    }
+
+    # Ends the Authelia session. Does NOT terminate an already-open browser stream (plan §17).
+    location = /logout {
+        return 302 https://${AUTHELIA_HOST}$public_port/logout?rd=https://${PUBLIC_HOST}$public_port/;
+    }
+
+    # Identity as a backend sees it (diagnostics and tests/phase1-auth.sh).
+    location = /whoami {
+        include /etc/nginx/snippets/proxy.conf;
+        include /etc/nginx/snippets/authelia-authrequest.conf;
+        proxy_pass http://127.0.0.1:8081;
+    }
+
+    # The user's own Selkies session. $browser_backend comes from the generated whitelist map
+    # (nginx.conf), keyed by the identity Authelia returned, never by a request header.
+    location / {
+        include /etc/nginx/snippets/proxy.conf;
+        include /etc/nginx/snippets/websocket.conf;
+        include /etc/nginx/snippets/authelia-authrequest.conf;
+
+        # The browser container never sees the client's cookies or credentials: the Authelia session
+        # cookie may be the site-wide SSO cookie, and code in a compromised browser container could
+        # read requests to it. (The authz subrequest above still receives the cookies.)
+        proxy_set_header Cookie "";
+        proxy_set_header Authorization "";
+        proxy_set_header Proxy-Authorization "";
+        proxy_hide_header Set-Cookie;
+
+        # Container stopped, starting or restarting.
+        error_page 502 504 /_errors/browser-unavailable.html;
+
+        proxy_pass http://$browser_backend;
+    }
+}
+
+# --- Local backend: identity echo (/whoami) and the page for users without a browser. ----------------
+# The echo shows exactly what a real backend receives, so header spoofing can be tested end to end.
+server {
+    listen 127.0.0.1:8081;
+    set $auth_user "";
+    default_type text/plain;
+    add_header Cache-Control "no-store" always;
+
+    location = /whoami {
+        return 200 "Remote browser - identity seen by the backend\n\nremote_user=$http_remote_user\nremote_groups=$http_remote_groups\nremote_name=$http_remote_name\nremote_email=$http_remote_email\nx_remote_user=$http_x_remote_user\n\nLog out: https://${PUBLIC_HOST}$public_port/logout\n";
+    }
+
+    # Authorized by Authelia, but no browser container is provisioned for this user (yet).
+    location / {
+        error_page 503 /not-provisioned.html;
+        return 503;
+    }
+
+    location = /not-provisioned.html {
+        internal;
+        root /usr/share/nginx/remote-browser;
+    }
+}

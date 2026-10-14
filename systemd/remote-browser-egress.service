@@ -1,0 +1,24 @@
+# Egress filter for the browser containers (scripts/egress-firewall.sh, plan §30a).
+# Rootful Docker. Install (replace the path with your checkout, which should be root-owned:
+# this unit runs the script as root):
+#   sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/remote-browser-egress.service \
+#       | sudo tee /etc/systemd/system/remote-browser-egress.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-egress.service
+#
+# PartOf/WantedBy docker.service: re-applied whenever Docker (re)starts. Docker keeps the rules of
+# its DOCKER-USER chain across restarts, but a firewalld reload can drop them; restart this unit
+# after reloading firewalld.
+[Unit]
+Description=Remote browser: block browser containers from LAN and host
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@REPO_DIR@/scripts/egress-firewall.sh apply
+ExecStop=@REPO_DIR@/scripts/egress-firewall.sh remove
+
+[Install]
+WantedBy=docker.service

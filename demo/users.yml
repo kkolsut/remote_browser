@@ -1,0 +1,29 @@
+---
+# Dummy users for the local demo (scripts/demo.sh). NOT for production: the password of every user
+# is "demo". Hashes: openssl passwd -6 <password>. After editing: ./scripts/demo.sh restart authelia
+# (the file watch does not see every kind of edit through the bind mount).
+users:
+  alice:
+    displayname: 'Alice (in the access group)'
+    email: 'alice@example.com'
+    password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
+    groups:
+      - 'remote-browser-users'
+  bob:
+    displayname: 'Bob (not in the access group)'
+    email: 'bob@example.com'
+    password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
+    groups: []
+  carol:
+    displayname: 'Carol (disabled)'
+    email: 'carol@example.com'
+    password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
+    disabled: true
+    groups:
+      - 'remote-browser-users'
+  dave:
+    displayname: 'Dave (in the access group, no browser provisioned)'
+    email: 'dave@example.com'
+    password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
+    groups:
+      - 'remote-browser-users'

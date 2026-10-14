@@ -1,0 +1,20 @@
+#!/usr/bin/with-contenv bash
+# Runs as root after the base image's init-selkies-config, before the session starts.
+#
+# The base image copies /defaults/autostart and menu.xml into the persistent home only when they are
+# missing, so an image update would never reach existing users. Install them on every start.
+
+conf_dir="$HOME/.config/openbox"
+mkdir -p "$conf_dir"
+chown abc:abc "$HOME/.config" "$conf_dir"
+
+install -m 0644 -o abc -g abc /defaults/menu.xml "$conf_dir/menu.xml"
+rm -f "$conf_dir/menu.xml.bak"
+
+# RESTART_APP: root-owned and read-only for the user, as the base image does it.
+install -m 0550 -o root -g abc /defaults/autostart "$conf_dir/autostart"
+
+# The user's home is private (plan §19), even when the host directory was created by Docker.
+chmod 0700 "$HOME"
+
+echo "[remote-browser] session for ${REMOTE_BROWSER_USER:-unknown} (uid $(id -u abc)) ready"

@@ -1,0 +1,73 @@
+---
+# Authelia of the LOCAL DEMO only (scripts/demo.sh). In production the site's existing Authelia is
+# used; what it needs is in docs/apache-authelia.md. The parts that matter for this service are the
+# same here: the "remote-browser" authz endpoint, the access rule, and regulation.
+#
+# Rendered with Authelia's template filter; values come from demo/demo.env via compose.demo.yaml.
+# Secrets come from /secrets (scripts/init-secrets.sh).
+
+theme: 'auto'
+
+server:
+  address: 'tcp://:9091/'
+  endpoints:
+    authz:
+      # Endpoint for this service only: session cookie, no credentials in Authorization /
+      # Proxy-Authorization headers (they would bypass the portal, regulation and 2FA).
+      remote-browser:
+        implementation: 'AuthRequest'
+        authn_strategies:
+          - name: 'CookieSession'
+
+log:
+  level: 'debug'
+
+ntp:
+  disable_failure: true
+
+totp:
+  issuer: '{{ mustEnv "PUBLIC_HOST" }}'
+
+authentication_backend:
+  password_reset:
+    disable: true
+  password_change:
+    disable: true
+  refresh_interval: '1m'
+  # Dummy users from demo/users.yml instead of FreeIPA.
+  file:
+    path: '/config/users.yml'
+    watch: true
+
+access_control:
+  default_policy: 'deny'
+  rules:
+    - domain: '{{ mustEnv "PUBLIC_HOST" }}'
+      policy: 'one_factor'
+      subject:
+        - 'group:{{ mustEnv "FREEIPA_BROWSER_GROUP" }}'
+
+session:
+  same_site: 'lax'
+  inactivity: '1h'
+  expiration: '12h'
+  remember_me: -1  # disabled
+  cookies:
+    - domain: '{{ mustEnv "PUBLIC_HOST" }}'
+      authelia_url: 'https://{{ mustEnv "PORTAL_HOST" }}:{{ mustEnv "PUBLIC_PORT" }}'
+      default_redirection_url: 'https://{{ mustEnv "PUBLIC_HOST" }}:{{ mustEnv "PUBLIC_PORT" }}/'
+
+# Bans before FreeIPA's lockout (krbPwdMaxFailure, default 6) would lock the account domain-wide.
+regulation:
+  max_retries: 3
+  find_time: '2m'
+  ban_time: '15m'
+
+storage:
+  local:
+    path: '/data/db.sqlite3'
+
+notifier:
+  filesystem:
+    filename: '/data/notification.txt'
+...

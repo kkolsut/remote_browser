@@ -1,0 +1,51 @@
+# Phase 2: the browser container of ONE hand-configured test user (plan §63). Phase 3 replaces this
+# file with generated/compose.users.yaml, one service + network per FreeIPA user.
+#
+#   docker compose -f compose.yaml -f compose.browser-test.yaml up -d
+#
+# Needs in .env: BROWSER_IMAGE, BROWSER_TEST_USER, BROWSER_TEST_UID, BROWSER_TEST_GID (the user's
+# FreeIPA uidNumber/gidNumber), BROWSER_TEST_SUBNET, plus the Nginx map entry and the profile
+# directory (README, "Phase 2").
+
+services:
+  browser-test:
+    image: ${BROWSER_IMAGE:?set BROWSER_IMAGE in .env (output of scripts/build-browser-image.sh)}
+    # Stable hostname: Chrome and Firefox profile locks embed it (plan §24).
+    hostname: browser-${BROWSER_TEST_USER:?set BROWSER_TEST_USER in .env}
+    restart: unless-stopped
+    environment:
+      # The session user runs as the FreeIPA uidNumber/gidNumber (plan §19).
+      PUID: ${BROWSER_TEST_UID:?set BROWSER_TEST_UID in .env}
+      PGID: ${BROWSER_TEST_GID:?set BROWSER_TEST_GID in .env}
+      TZ: ${TZ:-UTC}
+      REMOTE_BROWSER_USER: ${BROWSER_TEST_USER}
+      # Selkies file upload/download between the user's device and /config. Off unless set (plan §43).
+      SELKIES_FILE_TRANSFERS: ${BROWSER_FILE_TRANSFERS:-}
+      # Cross-site WebSocket hijacking guard: only pages from the public origin may open the stream.
+      SELKIES_ALLOWED_ORIGINS: https://${PUBLIC_HOST},https://${PUBLIC_HOST}:${PUBLIC_PORT:-443}
+    volumes:
+      - ${USER_DATA_ROOT:-./local/users}/${BROWSER_TEST_USER}/config:/config
+    # Selkies has no authentication of its own: never publish it, only Nginx reaches it.
+    expose:
+      - "3000"
+    shm_size: 1gb
+    networks:
+      browser-test:
+        aliases:
+          - browser-${BROWSER_TEST_USER}
+    security_opt:
+      # Docker's default profile plus clone/unshare for the browser sandboxes (plan §31,
+      # scripts/gen-seccomp-chrome.py). no-new-privileges is a Phase 5 decision.
+      - seccomp=./browser-image/seccomp-chrome.json
+
+  nginx:
+    networks:
+      browser-test: {}
+
+networks:
+  # This user's private network: Nginx and this one browser, nothing else (plan §30).
+  browser-test:
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${BROWSER_TEST_SUBNET:-10.213.0.16/28}
