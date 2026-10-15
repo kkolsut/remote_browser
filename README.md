@@ -20,7 +20,7 @@ Apache and Authelia integration: [`docs/apache-authelia.md`](docs/apache-autheli
 | 2 | Dual-browser Selkies image, chooser, seccomp, per-user network, egress firewall | **implemented**, verified in the local demo; awaiting deployment test |
 | 3 | `sync-freeipa-users.py` provisioning, timer, `kill-session.sh` | **implemented**, verified in the local demo (file-backed source) and unit tests (faked LDAP); awaiting test against FreeIPA |
 | 4 | Per-user routing for all users | **implemented** (generated whitelist map), verified in the local demo with two users |
-| 5 | Hardening, backup, rebuild timer | not started |
+| 5 | Hardening, weekly image update, backup/restore, health check, purge | **implemented**, verified in the local demo (sandboxes under the restrictions, smoke test, backup + restore test) |
 
 ## Layout
 
@@ -42,19 +42,29 @@ scripts/validate-freeipa.py      FreeIPA connectivity, permissions and eligibili
 scripts/freeipa_common.py        shared LDAP logic (same eligibility rules as Authelia)
 scripts/sync-freeipa-users.py    provisioning: FreeIPA group -> browser containers, networks, map, profiles
 scripts/kill-session.sh          end a user's open stream now (restarts their browser)
+scripts/update-browser-image.sh  weekly: build, smoke-test, roll out the Chrome/Firefox image
+scripts/backup.sh, restore.sh    configuration, secrets and profiles; restore one profile or everything
+scripts/purge-user.sh            delete a former user's profile (the only way profiles are deleted)
+scripts/healthcheck.sh           OK/WARN/CRIT for monitoring
 scripts/validate-config.sh       compose config + seccomp profile + nginx -t
 scripts/build-browser-image.sh   build + version-tag the browser image
 scripts/gen-seccomp-chrome.py    regenerate browser-image/seccomp-chrome.json from Docker's default
 scripts/egress-firewall.sh       block browser containers from LAN/host (iptables DOCKER-USER/INPUT)
 systemd/remote-browser-egress.service   applies the egress filter at boot
 systemd/remote-browser-sync.{service,timer}   runs the sync every 5 minutes
+systemd/remote-browser-image-update.{service,timer}   weekly browser update (Sunday night)
+systemd/remote-browser-backup.{service,timer}   nightly backup
 tests/phase1-auth.sh             authentication/authorization through the public URL
 tests/routing.sh                 user -> own browser, WebSocket, no fallback, forged headers, no bypass
 tests/phase2-browser.sh          container hardening, chooser, sandboxes, persistence, egress
 tests/phase3-sync.sh             provisioning on a live stack: consistency, isolation, idempotence
 tests/test_sync.py               sync unit tests: fail-safe, eligibility, generated files (no LDAP needed)
+tests/backup-restore.sh          backup, profile restore, configuration restore into a fresh checkout
 docs/apache-authelia.md          what to add to your Apache and Authelia
 docs/freeipa.md                  FreeIPA preparation
+docs/security.md                 controls, where they are enforced and tested; accepted risks
+docs/backup.md                   backup layers, restoring a profile, restoring on a clean VM
+docs/troubleshooting.md          common problems, where the logs are
 ```
 
 ## Local demo (no FreeIPA)
@@ -68,7 +78,7 @@ first `up` builds the browser image (~5 GB, several minutes).
 
 ```bash
 ./scripts/demo.sh up        # https://browser.localhost:8443/ (self-signed; accept it for both names)
-./scripts/demo.sh test      # phase1-auth.sh, routing.sh, phase2-browser.sh, phase3-sync.sh
+./scripts/demo.sh test      # phase1-auth.sh, routing.sh, phase2-browser.sh, phase3-sync.sh, backup-restore.sh
 ./scripts/demo.sh sync      # provision after editing demo/users.yml (after: demo.sh restart authelia)
 ./scripts/demo.sh build     # rebuild the browser image after changing browser-image/
 ./scripts/demo.sh logs -f
@@ -273,13 +283,39 @@ Manual acceptance (plan §63):
 4. Set a bookmark in each browser, run `./scripts/kill-session.sh <uid>`, and check that both
    bookmarks are still there.
 
+### 7. Updates, backup, monitoring
+
+```bash
+for u in remote-browser-image-update remote-browser-backup; do
+    for t in service timer; do
+        sed "s|@REPO_DIR@|$PWD|" systemd/$u.$t | sudo tee /etc/systemd/system/$u.$t >/dev/null
+    done
+done
+sudo systemctl daemon-reload
+sudo systemctl enable --now remote-browser-image-update.timer remote-browser-backup.timer
+sudo apt install unattended-upgrades      # Debian security updates for the VM itself
+```
+
+- **Browser updates** (Sunday night): `update-browser-image.sh` builds an image with the current
+  Chrome and Firefox. If either changed, it smoke-tests the image in a throwaway container with the
+  production restrictions and no network (chooser, both sandboxes, persistence). Then it sets
+  `BROWSER_IMAGE` and runs the sync. A failure changes nothing. The newest three images are kept for
+  rollback.
+- **Backup** (nightly): configuration, secrets and profiles into `BACKUP_DIR`. Copy it off the VM.
+  Before go-live, run the restore test on the demo or the VM (`tests/backup-restore.sh`, then the
+  clean-VM procedure in [`docs/backup.md`](docs/backup.md)).
+- **Monitoring:** `sudo ./scripts/healthcheck.sh` prints OK/WARN/CRIT and exits 0/1/2. Hook it into
+  what you have, e.g. cron (`--quiet`, mails only problems) or an Uptime Kuma push monitor.
+
 ### What the browser container is and is not allowed
 
 - Runs as the user's FreeIPA uid. There is no `sudo` in the image, and the user is not in the `sudo` or
   `docker` groups. No Docker socket, not privileged, no published ports. Only Nginx shares its network.
 - Seccomp: Docker's default profile plus `clone`/`unshare` for the browser sandboxes
-  (`scripts/gen-seccomp-chrome.py`). Never `--no-sandbox`. `no-new-privileges` and capability drops are
-  Phase 5, after testing them against the sandboxes.
+  (`scripts/gen-seccomp-chrome.py`). Never `--no-sandbox`.
+- `no-new-privileges`, all capabilities dropped except the few the init needs plus `SYS_CHROOT` (which
+  both sandboxes need), 4096 processes at most, rotated logs. All of this is tested against the
+  sandboxes; the reasons are in [`docs/security.md`](docs/security.md).
 - It never sees the client's cookies or `Authorization` headers: Nginx strips them, so a site-wide
   Authelia SSO cookie cannot leak into a remote session.
 - Selkies:
@@ -301,12 +337,14 @@ Manual acceptance (plan §63):
 - **Logout:** `https://browser.example.com/logout` → Authelia logout. It does **not** end an
   already-open browser stream. Only stopping or restarting the user's container does (plan §17):
   `./scripts/kill-session.sh <uid>`. To lock someone out, disable them in FreeIPA first.
-- **Deleting a profile:** the sync never deletes one. When a user will not come back and the sync has
-  removed their browser, delete `USER_DATA_ROOT/<uid>` by hand.
 - **Browser updates:** run `./scripts/build-browser-image.sh` and smoke-test with the test user. Then set
   the new tag in `BROWSER_IMAGE` and run the sync (or wait for the timer). It recreates every browser,
-  which ends open streams. Chrome and Firefox never update themselves inside the image, so rebuild at
-  least weekly (the timer comes in Phase 5).
+  which ends open streams. The weekly timer (step 7) does all of this, after a smoke test, and only
+  when Chrome or Firefox changed. For an actively exploited browser bug:
+  `sudo systemctl start remote-browser-image-update`.
+- **Backup / restore:** [`docs/backup.md`](docs/backup.md). **Deleting a former user's profile:**
+  `sudo ./scripts/purge-user.sh <uid>`.
+- **Health:** `sudo ./scripts/healthcheck.sh`. **Problems:** [`docs/troubleshooting.md`](docs/troubleshooting.md).
 - **After `docker compose up -d`:** run the sync. If Compose recreated Nginx, the sync puts it back on
   the user networks.
 - **Login policy, 2FA, brute-force regulation:** in your Authelia (`docs/apache-authelia.md` §1).

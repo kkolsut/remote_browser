@@ -12,6 +12,8 @@
 #   EGRESS_TARGETS   extra "ip:port" targets that must be blocked, e.g. "192.168.1.10:8006 10.0.0.5:636"
 #                    (Proxmox, FreeIPA, ...). The host's addresses and private ranges are always tested.
 #   SKIP_RESTART=1   skip the container restart (persistence) part
+#   SMOKE=1          a new image in a throwaway container without Nginx or network
+#                    (scripts/update-browser-image.sh): skip the network and egress parts
 #
 # The restart closes any browser the user has open in that container.
 set -uo pipefail
@@ -48,22 +50,43 @@ check "hostname is browser-$BROWSER_USER" test "$(inspect '{{.Config.Hostname}}'
 check "not privileged" test "$(inspect '{{.HostConfig.Privileged}}')" == false
 check "no published ports" test -z "$(inspect '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}} {{end}}{{end}}')"
 check "no Docker socket mounted" not grep -q docker.sock <<<"$(inspect '{{range .Mounts}}{{.Source}} {{end}}')"
-check "custom seccomp profile (not unconfined)" grep -q 'seccomp={' <<<"$(inspect '{{json .HostConfig.SecurityOpt}}')"
-networks="$(inspect '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}')"
-check "attached to exactly one network" test "$(wc -w <<<"$networks")" == 1
-net="${networks%% *}"
-members="$(docker network inspect --format '{{range .Containers}}{{.Name}} {{end}}' "$net")"
-check "its network holds only this browser and nginx" test "$(wc -w <<<"$members")" == 2 -a -n "$(grep -o "${PROJECT}-nginx-1" <<<"$members")"
-# Nginx reaches Authelia over its default route; through a browser network it would be egress-filtered.
-nginx_cid="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=nginx")"
-front_gw="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "${PROJECT}_frontend")"
-nginx_gw="$(docker exec "$nginx_cid" ip route 2>&1 | sed -n 's/^default via \([0-9.]*\).*/\1/p')"
-check "nginx's default route is the frontend network (via ${nginx_gw:-none})" test -n "$front_gw" -a "$nginx_gw" == "$front_gw"
+# Checked in the kernel's view of the container (/proc/1/status), the same on Docker and Podman,
+# whose APIs report these options differently.
+status1="$(docker exec "$cid" cat /proc/1/status)"
+field() { awk -v k="$1:" '$1 == k { print $2 }' <<<"$status1"; }
+check "seccomp filter active (not unconfined)" test "$(field Seccomp)" == 2
+check "no-new-privileges set" test "$(field NoNewPrivs)" == 1
+# Exactly CHOWN DAC_OVERRIDE FOWNER KILL SETGID SETUID SYS_CHROOT (bits 0 1 3 5 6 7 18): no NET_RAW,
+# MKNOD, SYS_ADMIN or anything else.
+capbnd="$(field CapBnd)"
+check "capability set exactly as configured (CapBnd=$capbnd)" test "$(( 0x${capbnd:-ffffffff} ))" == "$(( 0x400eb ))"
+check "process limit set" test "$(inspect '{{.HostConfig.PidsLimit}}')" -gt 0
+# Docker reports log options in .HostConfig.LogConfig.Config, Podman's Docker API does not: ask its own.
+log_size="$(inspect '{{index .HostConfig.LogConfig.Config "max-size"}}')"
+if [[ -z "$log_size" && "$(docker version --format '{{range .Server.Components}}{{.Name}} {{end}}' 2>/dev/null)" == *Podman* ]]; then
+    log_size="$(curl -s --unix-socket "${DOCKER_HOST#unix://}" "http://d/v5.0.0/libpod/containers/$cid/json" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["HostConfig"]["LogConfig"].get("Size") or "")')"
+fi
+check "log rotation set (${log_size:-none})" test -n "$log_size"
+if [[ "${SMOKE:-0}" != 1 ]]; then
+    networks="$(inspect '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}')"
+    check "attached to exactly one network" test "$(wc -w <<<"$networks")" == 1
+    net="${networks%% *}"
+    members="$(docker network inspect --format '{{range .Containers}}{{.Name}} {{end}}' "$net")"
+    check "its network holds only this browser and nginx" test "$(wc -w <<<"$members")" == 2 -a -n "$(grep -o "${PROJECT}-nginx-1" <<<"$members")"
+    # Nginx reaches Authelia over its default route; through a browser network it would be egress-filtered.
+    nginx_cid="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=nginx")"
+    front_gw="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "${PROJECT}_frontend")"
+    # The route actually used (Docker: gw_priority; Podman: the frontend network's lower metric).
+    nginx_gw="$(docker exec "$nginx_cid" ip route get 1.1.1.1 2>&1 | sed -n 's/.* via \([0-9.]*\) .*/\1/p')"
+    check "nginx's default route is the frontend network (via ${nginx_gw:-none})" test -n "$front_gw" -a "$nginx_gw" == "$front_gw"
+fi
 
 echo "== user and profile"
 check "PUID is not root" test "$PUID" != 0
 check "/config owned by PUID, mode 0700" test "$(as_root stat -c '%u %a' /config)" == "$PUID 700"
-check "launcher runs as the session user" test -n "$(as_root pgrep -u "$PUID" -f /usr/local/bin/browser-launcher)"
+launcher_running() { as_root pgrep -u "$PUID" -f /usr/local/bin/browser-launcher >/dev/null; }
+check "launcher runs as the session user" wait_for 60 launcher_running
 check "no browser-launcher runs as root" not as_root pgrep -u 0 -f /usr/local/bin/browser-launcher
 check "no sudo in the image" not as_root sh -c 'command -v sudo'
 groups="$(as_user id -Gn 2>/dev/null)"
@@ -134,27 +157,29 @@ if [[ "${SKIP_RESTART:-0}" != 1 ]]; then
     as_user sh -c 'rm -f /config/.config/google-chrome/rb-persistence-marker /config/.mozilla/firefox/*/rb-persistence-marker /config/.config/mozilla/firefox/*/rb-persistence-marker'
 fi
 
-echo "== egress"
-code="$(as_user curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.google.com/generate_204 2>&1)"
-check "public Internet reachable (got $code)" test "$code" == 204
+if [[ "${SMOKE:-0}" != 1 ]]; then
+    echo "== egress"
+    code="$(as_user curl -sS -m 15 -o /dev/null -w '%{http_code}' https://www.google.com/generate_204 2>&1)"
+    check "public Internet reachable (got $code)" test "$code" == 204
 
-# A blocked target must fail at once with "No route to host" (REJECT icmp-admin-prohibited).
-# "Connection refused" or a successful connect means the target was reached.
-blocked() {
-    local target="$1" out
-    out="$(as_user timeout 8 bash -c "exec 3<>/dev/tcp/${target%:*}/${target##*:}" 2>&1)"
-    if grep -q 'No route to host' <<<"$out"; then ok "blocked: $target"
-    else bad "blocked: $target" "${out:-connected}"; fi
-}
-gateway="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$net")"
-host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
-for target in "$gateway:22" "${host_ip:-}:22" 10.0.0.1:80 172.16.0.1:80 192.168.0.1:80 100.64.0.1:80 169.254.169.254:80 ${EGRESS_TARGETS:-}; do
-    [[ "$target" == :* ]] && continue
-    blocked "$target"
-done
-out="$(as_user curl -sS -m 5 http://authelia:9091/ 2>&1)"
-check "Authelia not resolvable/reachable from the browser" grep -qiE 'resolve|No route' <<<"$out"
+    # A blocked target must fail at once with "No route to host" (REJECT icmp-admin-prohibited).
+    # "Connection refused" or a successful connect means the target was reached.
+    blocked() {
+        local target="$1" out
+        out="$(as_user timeout 8 bash -c "exec 3<>/dev/tcp/${target%:*}/${target##*:}" 2>&1)"
+        if grep -q 'No route to host' <<<"$out"; then ok "blocked: $target"
+        else bad "blocked: $target" "${out:-connected}"; fi
+    }
+    gateway="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$net")"
+    host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+    for target in "$gateway:22" "${host_ip:-}:22" 10.0.0.1:80 172.16.0.1:80 192.168.0.1:80 100.64.0.1:80 169.254.169.254:80 ${EGRESS_TARGETS:-}; do
+        [[ "$target" == :* ]] && continue
+        blocked "$target"
+    done
+    out="$(as_user curl -sS -m 5 http://authelia:9091/ 2>&1)"
+    check "Authelia not resolvable/reachable from the browser" grep -qiE 'resolve|No route' <<<"$out"
 
+fi
 echo
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

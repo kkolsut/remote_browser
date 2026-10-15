@@ -29,8 +29,10 @@ services:
       AUTHELIA_AUTHZ_URL: ${AUTHELIA_AUTHZ_URL:?set AUTHELIA_AUTHZ_URL in .env}
       AUTHELIA_CA_FILE: ${AUTHELIA_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
       TRUSTED_PROXY: ${TRUSTED_PROXY:?set TRUSTED_PROXY in .env (address of the reverse proxy)}
+      # NGINX_LOCAL_RESOLVERS from /etc/resolv.conf, for the template's resolver (Docker or Podman DNS).
+      NGINX_ENTRYPOINT_LOCAL_RESOLVERS: "1"
       # Only these variables are substituted into nginx/templates/*.template.
-      NGINX_ENVSUBST_FILTER: "^(PUBLIC_HOST|AUTHELIA_HOST|PUBLIC_PORT|AUTHELIA_AUTHZ_URL|AUTHELIA_CA_FILE|TRUSTED_PROXY)$$"
+      NGINX_ENVSUBST_FILTER: "^(PUBLIC_HOST|AUTHELIA_HOST|PUBLIC_PORT|AUTHELIA_AUTHZ_URL|AUTHELIA_CA_FILE|TRUSTED_PROXY|NGINX_LOCAL_RESOLVERS)$$"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/templates:/etc/nginx/templates:ro
@@ -50,6 +52,30 @@ services:
         gw_priority: 100
     security_opt:
       - no-new-privileges:true
+    # Root only to start: binds 443, renders the templates, then the workers run as "nginx".
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /etc/nginx/conf.d:size=1m       # rendered templates
+      - /var/cache/nginx:size=64m
+      - /run:size=1m
+      - /tmp:size=16m
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 networks:
   # The published port, and Nginx's way out to Authelia.

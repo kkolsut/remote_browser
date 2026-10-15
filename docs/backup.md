@@ -1,0 +1,73 @@
+# Backup and restore
+
+Plan §46-47. Two layers:
+1. **Proxmox Backup Server snapshots of the VM**: the primary backup, which restores everything at once.
+2. **`scripts/backup.sh`**: file-level and nightly. It restores single profiles, and rebuilds the VM
+   from Git plus one directory.
+
+## What `backup.sh` writes
+
+`BACKUP_DIR/remote-browser-<date>-<time>/` (directory `0700`, root):
+
+| File | Contents |
+|---|---|
+| `config.tar.gz` | `.env`, `SECRETS_DIR`, `TLS_DIR` (incl. the private key), CA directories, `generated/` (keeps each user's subnet), `nginx/generated/` |
+| `config-abs.tar.gz` | the same for paths outside the checkout, if any |
+| `users/<uid>.tar.gz` | each profile in `USER_DATA_ROOT`, with numeric ownership; also users who currently have no browser |
+| `MANIFEST`, `SHA256SUMS` | date, host, commit, `BROWSER_IMAGE`; checksums verified before every restore |
+
+Not included:
+- browser caches (the list in plan §46);
+- the images, which are rebuilt from Git;
+- the existing Authelia's database, which is backed up with Authelia.
+
+Each user's browser is paused while their profile is archived, so Chrome's and Firefox's SQLite files
+are consistent; an open stream freezes for that time. The newest `BACKUP_KEEP` (default 7) are kept.
+
+```bash
+sudo ./scripts/backup.sh                    # by hand
+# nightly, 02:30:
+for u in remote-browser-backup.service remote-browser-backup.timer; do
+    sed "s|@REPO_DIR@|$PWD|" systemd/$u | sudo tee /etc/systemd/system/$u >/dev/null
+done
+sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-backup.timer
+```
+
+**Copy `BACKUP_DIR` off the VM** (rsync, restic, the PBS client). A backup on the same disk does not
+protect against losing the VM. It contains every user's profile and all secrets: encrypt it in transit
+and at rest.
+
+## Restore one profile
+
+A user broke their profile, or wants yesterday's back:
+
+```bash
+sudo ./scripts/restore.sh /path/to/remote-browser-<date> --users alice
+```
+
+The script:
+- stops `browser-alice`;
+- moves the current profile to `alice.before-restore-<time>` (delete it once the user is happy);
+- extracts the backup with its original ownership;
+- starts the browser again.
+
+## Restore the whole service on a clean VM (restore test, plan §47)
+
+1. A Debian VM as in README §1 (Docker CE, `python3-ldap3`).
+2. The repository, at the commit in `MANIFEST` or newer:
+   `sudo git clone <repo> /opt/remote-browser && cd /opt/remote-browser`.
+3. The configuration and secrets:
+   `sudo ./scripts/restore.sh <backup> --config`.
+4. The browser image: `./scripts/build-browser-image.sh`. Set its tag as `BROWSER_IMAGE` in `.env`
+   (the old tag exists only on the old VM).
+5. Infrastructure: `./scripts/validate-config.sh && docker compose up -d nginx`.
+6. Egress filter and timers: README §6.
+7. The profiles: `sudo ./scripts/restore.sh <backup> --users`.
+8. The browsers: `sudo ./scripts/sync-freeipa-users.py`.
+9. Log in as the test user. Chrome and Firefox show the bookmarks set before the backup.
+
+If the new VM answers on a new address, update Apache's `ProxyPass` target. If the certificate in
+`TLS_DIR` came from the backup, the pinned certificate in Apache still matches.
+
+`tests/backup-restore.sh` automates the profile part and the configuration part on a running stack.
+On the demo, run it with `ENV_FILE=demo/demo.env tests/backup-restore.sh`.

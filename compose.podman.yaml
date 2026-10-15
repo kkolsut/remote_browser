@@ -1,0 +1,12 @@
+# Podman only: add after compose.yaml in COMPOSE_FILE (e.g. compose.yaml:compose.podman.yaml:generated/...).
+#
+# Nginx sits on every user network, but its own traffic (to Authelia) must leave through "frontend":
+# through a user network it would be egress-filtered. Docker picks the route by gw_priority
+# (compose.yaml). Podman ignores gw_priority and offers a route metric instead, which only a network
+# created through Podman's own API can carry, so scripts/podman-setup.sh creates "frontend" with
+# metric 50 (user networks: 100) and Compose uses it as an external network.
+
+networks:
+  frontend:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-remote-browser}_frontend

@@ -1,0 +1,20 @@
+# Nightly file-level backup (scripts/backup.sh, plan §46) into BACKUP_DIR; keeps BACKUP_KEEP backups.
+# Each user's browser is paused while their profile is archived (an open stream freezes, it does not
+# end), hence at night. Copy BACKUP_DIR off the VM; Proxmox Backup Server snapshots come first.
+# Install (replace the path with your root-owned checkout):
+#   for u in remote-browser-backup.service remote-browser-backup.timer; do
+#       sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/$u | sudo tee /etc/systemd/system/$u
+#   done
+#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-backup.timer
+[Unit]
+Description=Remote browser: back up configuration, secrets and profiles
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/backup.sh
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

@@ -26,6 +26,12 @@ services:
       - nginx
       - authelia
 
+  nginx:
+    # The demo's TLS key belongs to you, not root (production: root-owned, see init-secrets.sh), and
+    # Nginx runs without DAC_OVERRIDE: let it read files it does not own.
+    cap_add:
+      - DAC_READ_SEARCH
+
   authelia:
     image: authelia/authelia:4.39.28
     restart: unless-stopped
@@ -57,4 +63,4 @@ networks:
   frontend:
     ipam:
       config:
-        - subnet: 10.214.0.0/24
+        - subnet: ${FRONTEND_SUBNET:?}

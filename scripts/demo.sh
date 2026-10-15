@@ -7,15 +7,31 @@
 #
 # Usage: ./scripts/demo.sh up        create secrets + certificate, build the image if missing, start, sync
 #        ./scripts/demo.sh sync      provision browsers after editing demo/users.yml (sync options pass through)
-#        ./scripts/demo.sh test      run the phase 1-3 tests against it
+#        ./scripts/demo.sh test      run all tests against it (phases 1-3, backup/restore)
 #        ./scripts/demo.sh build     rebuild the browser image (local/remote-dual-browser:demo)
 #        ./scripts/demo.sh down      stop it (rm -rf local/demo to start from scratch)
 #        ./scripts/demo.sh <args>    any other docker compose command (logs -f, ps, ...)
+#        DEMO_ENGINE=podman ./scripts/demo.sh ...   the same on rootful Podman instead of Docker
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 env_file="$repo_dir/demo/demo.env"
 env_get() { grep -E "^$1=" "$env_file" | tail -n1 | cut -d= -f2-; }
+engine="${DEMO_ENGINE:-docker}"
+
+# DEMO_ENGINE=podman: the same demo on rootful Podman (scripts/podman-setup.sh). The docker CLI talks
+# to Podman's socket; the env file is demo/demo.env plus compose.podman.yaml in COMPOSE_FILE.
+# Don't run both engines' demos at once: same ports, same subnets.
+if [[ "$engine" == podman ]]; then
+    export DOCKER_HOST="unix:///run/podman/podman.sock"
+    mkdir -p "$repo_dir/local/demo"
+    podman_env="$repo_dir/local/demo/demo-podman.env"
+    { sed 's|^COMPOSE_FILE=compose.yaml:|COMPOSE_FILE=compose.yaml:compose.podman.yaml:|' "$env_file"
+      echo "CONTAINER_ENGINE=podman"; } > "$podman_env"
+    env_file="$podman_env"
+elif [[ "$engine" != docker ]]; then
+    echo "DEMO_ENGINE must be docker or podman" >&2; exit 2
+fi
 project="$(env_get COMPOSE_PROJECT_NAME)"
 
 # Every demo browser runs as you, so everything under local/demo stays yours.
@@ -38,6 +54,15 @@ case "${1:-}" in
     up)
         shift
         ENV_FILE="$env_file" "$repo_dir/scripts/init-secrets.sh" --self-signed-tls >/dev/null
+        if [[ "$engine" == podman ]]; then
+            ENV_FILE="$env_file" "$repo_dir/scripts/podman-setup.sh"
+            # Reuse an image Docker already built instead of building ~5 GB again.
+            if ! docker image inspect "$(env_get BROWSER_IMAGE)" >/dev/null 2>&1 \
+                    && DOCKER_HOST=unix:///var/run/docker.sock docker image inspect "$(env_get BROWSER_IMAGE)" >/dev/null 2>&1; then
+                echo "Copying $(env_get BROWSER_IMAGE) from Docker to Podman..."
+                DOCKER_HOST=unix:///var/run/docker.sock docker save "$(env_get BROWSER_IMAGE)" | docker load
+            fi
+        fi
         docker image inspect "$(env_get BROWSER_IMAGE)" >/dev/null 2>&1 || build_image
         # The generated Compose file first (docker compose needs it), then the infrastructure, then
         # the browsers: the sync creates the profile directories and attaches Nginx to their networks.
@@ -84,8 +109,10 @@ MSG
         PROJECT="$project" SERVICE=browser-alice "$repo_dir/tests/phase2-browser.sh" || rc=1
         echo
         ENV_FILE="$env_file" "$repo_dir/tests/phase3-sync.sh" || rc=1
+        echo
+        ENV_FILE="$env_file" BROWSER_USER=alice "$repo_dir/tests/backup-restore.sh" || rc=1
         exit $rc
         ;;
-    ""|-h|--help) sed -n '2,14p' "$0" ;;
+    ""|-h|--help) sed -n '2,15p' "$0" ;;
     *) dc "$@" ;;
 esac

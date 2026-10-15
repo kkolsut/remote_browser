@@ -1,0 +1,13 @@
+# Weekly browser image update; see remote-browser-image-update.service. For an actively exploited
+# browser bug, don't wait: sudo systemctl start remote-browser-image-update.service
+[Unit]
+Description=Remote browser: weekly Chrome/Firefox image update
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30
+RandomizedDelaySec=30min
+# Catch up after the VM was off at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

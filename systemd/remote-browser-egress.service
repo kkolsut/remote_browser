@@ -1,18 +1,17 @@
-# Egress filter for the browser containers (scripts/egress-firewall.sh, plan §30a).
-# Rootful Docker. Install (replace the path with your checkout, which should be root-owned:
-# this unit runs the script as root):
+# Egress filter for the browser containers (scripts/egress-firewall.sh, plan §30a): an nftables table
+# of its own, for Docker and Podman alike. Applied at boot before any container starts. Install
+# (replace the path with your root-owned checkout):
 #   sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/remote-browser-egress.service \
 #       | sudo tee /etc/systemd/system/remote-browser-egress.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-egress.service
 #
-# PartOf/WantedBy docker.service: re-applied whenever Docker (re)starts. Docker keeps the rules of
-# its DOCKER-USER chain across restarts, but a firewalld reload can drop them; restart this unit
-# after reloading firewalld.
+# Restarting a service that flushes the whole ruleset (Debian's nftables.service) removes the table:
+# restart this unit afterwards. PartOf makes that automatic for nftables.service.
 [Unit]
-Description=Remote browser: block browser containers from LAN and host
-Requires=docker.service
-After=docker.service
-PartOf=docker.service
+Description=Remote browser: block browser containers from LAN, host and each other
+After=nftables.service firewalld.service network-pre.target
+Before=docker.service podman.service podman-restart.service
+PartOf=nftables.service
 
 [Service]
 Type=oneshot
@@ -21,4 +20,4 @@ ExecStart=@REPO_DIR@/scripts/egress-firewall.sh apply
 ExecStop=@REPO_DIR@/scripts/egress-firewall.sh remove
 
 [Install]
-WantedBy=docker.service
+WantedBy=multi-user.target

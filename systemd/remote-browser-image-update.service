@@ -1,0 +1,25 @@
+# Weekly browser security update (scripts/update-browser-image.sh, plan §54): build, smoke-test and
+# roll out a fresh Chrome/Firefox image. Rolling out restarts every browser, which ends open streams;
+# the timer runs at night for that reason. Nothing is restarted when neither browser changed.
+# Install (replace the path with your root-owned checkout):
+#   for u in remote-browser-image-update.service remote-browser-image-update.timer; do
+#       sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/$u | sudo tee /etc/systemd/system/$u
+#   done
+#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-image-update.timer
+# Log: journalctl -u remote-browser-image-update.service. A failed smoke test leaves the old image
+# running and the unit failed.
+[Unit]
+Description=Remote browser: rebuild, test and roll out the Chrome/Firefox image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/update-browser-image.sh
+# Building (~5 GB) and the smoke test take a while.
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes

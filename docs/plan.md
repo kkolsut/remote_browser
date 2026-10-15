@@ -20,6 +20,19 @@
 - The deployment checkout is root-owned (`/opt/remote-browser`); the sync runs as root from it.
 - `AUTH_BACKEND=file` (local demo only): the sync reads Authelia's users file instead of FreeIPA.
 
+Phase 5 (hardening) as implemented:
+- Browsers: `no-new-privileges`, `cap_drop: ALL` plus CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL
+  and **SYS_CHROOT**. Docker's seccomp profile allows `chroot(2)` only with that capability, and both
+  browser sandboxes chroot. Without it the sandboxes silently turned off (found by
+  `tests/phase2-browser.sh`). Also `pids_limit`, a healthcheck, and log rotation. Nginx: read-only
+  root filesystem, four capabilities.
+- §54 weekly rebuild: `scripts/update-browser-image.sh` (+ timer) rolls out automatically after a
+  smoke test, and only when Chrome or Firefox changed. Older images are kept for rollback.
+- §46-47: `scripts/backup.sh` / `restore.sh` (+ nightly timer), tested by `tests/backup-restore.sh`.
+  §17 deletion: `scripts/purge-user.sh`. §48-49: `scripts/healthcheck.sh`. Docs: `docs/security.md`,
+  `docs/backup.md`, `docs/troubleshooting.md`.
+- §39: a second device of the same user joins the same desktop; the first connection stays open.
+
 ### Revision 3 (2026-10-13) — deployment behind the existing Apache and Authelia
 
 The service runs on its own VM behind the site's **existing Apache reverse proxy** and **existing

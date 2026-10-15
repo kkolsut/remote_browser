@@ -430,7 +430,11 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("ports", svc)
         self.assertNotIn("privileged", svc)
         self.assertNotIn("docker.sock", self.settings.compose_out.read_text())
-        self.assertEqual(svc["security_opt"], ["seccomp=./browser-image/seccomp-chrome.json"])
+        self.assertEqual(svc["security_opt"], ["seccomp=./browser-image/seccomp-chrome.json", "no-new-privileges:true"])
+        self.assertEqual(svc["cap_drop"], ["ALL"])
+        self.assertIn("SYS_CHROOT", svc["cap_add"])  # both browser sandboxes chroot
+        self.assertFalse({"SYS_ADMIN", "NET_RAW", "MKNOD", "NET_ADMIN"} & set(svc["cap_add"]))
+        self.assertGreater(svc["pids_limit"], 0)
         self.assertEqual(self.map_users(), ["alice", "bob-2"])
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0,
