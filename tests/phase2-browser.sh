@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 2 acceptance tests for one browser container (plan §63): container hardening, chooser,
+# Phase 2 acceptance tests for one user's browser container (plan §63): container hardening, chooser,
 # Chrome and Firefox start/exit and sandboxes, profile persistence across a restart, egress filter.
 #
 # Drives the real session through xdotool inside the container; no user is logged in during the
@@ -7,8 +7,8 @@
 #
 # Environment:
 #   PROJECT          Compose project name (default: remote-browser)
-#   SERVICE          Compose service (default: browser-test)
-#   BROWSER_USER     expected user (hostname browser-<user>); default: REMOTE_BROWSER_USER of the container
+#   BROWSER_USER     the user whose browser is tested (service browser-<user>)
+#   SERVICE          Compose service instead (default: browser-$BROWSER_USER)
 #   EGRESS_TARGETS   extra "ip:port" targets that must be blocked, e.g. "192.168.1.10:8006 10.0.0.5:636"
 #                    (Proxmox, FreeIPA, ...). The host's addresses and private ranges are always tested.
 #   SKIP_RESTART=1   skip the container restart (persistence) part
@@ -17,7 +17,8 @@
 set -uo pipefail
 
 PROJECT="${PROJECT:-remote-browser}"
-SERVICE="${SERVICE:-browser-test}"
+[[ -n "${SERVICE:-}${BROWSER_USER:-}" ]] || { echo "set BROWSER_USER (or SERVICE)" >&2; exit 2; }
+SERVICE="${SERVICE:-browser-$BROWSER_USER}"
 
 pass=0 fail=0
 ok()  { echo "PASS  $1"; pass=$((pass + 1)); }

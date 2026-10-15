@@ -4,6 +4,22 @@
 > **Supersedes:** the previous Google OAuth / per-browser-container design  
 > **Primary goal:** a lightweight self-hosted remote browser service authenticated against FreeIPA, with a persistent isolated browser environment for every authorized user.
 
+### Revision 4 (2026-10-15) — provisioning (Phase 3) as implemented
+
+- Nginx is **not** declared on the per-user networks in Compose (§30): Compose recreates a container
+  whose networks change, so every added user would restart Nginx and drop every open stream. The sync
+  attaches Nginx to `net-<uid>` with `docker network connect` and detaches/removes networks of removed
+  users. A recreated Nginx is on no user network until the next sync.
+- Each user keeps their `/28` across runs (`generated/state.json`); new users get the lowest free
+  block of `BROWSER_NET_POOL` that no other Docker network uses.
+- Also not provisioned: members without `uidNumber`/`gidNumber` or with 0, members sharing a
+  `uidNumber` (profiles would not be separated), and members whose profile directory is owned by
+  another uid (never re-chowned automatically).
+- Nginx is reloaded only when the map differs from the last loaded one: a reload keeps the old workers
+  alive until their WebSockets close, so reloading on every run would pile them up.
+- The deployment checkout is root-owned (`/opt/remote-browser`); the sync runs as root from it.
+- `AUTH_BACKEND=file` (local demo only): the sync reads Authelia's users file instead of FreeIPA.
+
 ### Revision 3 (2026-10-13) — deployment behind the existing Apache and Authelia
 
 The service runs on its own VM behind the site's **existing Apache reverse proxy** and **existing

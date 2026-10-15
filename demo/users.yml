@@ -1,7 +1,8 @@
 ---
 # Dummy users for the local demo (scripts/demo.sh). NOT for production: the password of every user
 # is "demo". Hashes: openssl passwd -6 <password>. After editing: ./scripts/demo.sh restart authelia
-# (the file watch does not see every kind of edit through the bind mount).
+# (the file watch does not see every kind of edit through the bind mount), then ./scripts/demo.sh sync
+# (the demo's stand-in for FreeIPA provisioning: group members who are not disabled get a browser).
 users:
   alice:
     displayname: 'Alice (in the access group)'
@@ -22,8 +23,14 @@ users:
     groups:
       - 'remote-browser-users'
   dave:
-    displayname: 'Dave (in the access group, no browser provisioned)'
+    displayname: 'Dave (in the access group)'
     email: 'dave@example.com'
+    password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
+    groups:
+      - 'remote-browser-users'
+  eve.smith:
+    displayname: 'Eve (in the access group, uid not a safe name: no browser)'
+    email: 'eve@example.com'
     password: '$6$fw8NN1.NJcJTzTbB$8w8ueqOQpAj76tpP1MjSoBUahgzNM2OIzTNGhJsCraKNIeQg1AsdzLCLwCxgnSjwTSz8lkBeEX4j3pnY9uS390'
     groups:
       - 'remote-browser-users'

@@ -1,0 +1,25 @@
+# Provisioning from FreeIPA (scripts/sync-freeipa-users.py, plan §16, §32), run by
+# remote-browser-sync.timer. Runs as root (it chowns profile directories to the users' uidNumbers and
+# drives Docker), so the checkout must be root-owned. Install (replace the path with your checkout):
+#   for u in remote-browser-sync.service remote-browser-sync.timer; do
+#       sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/$u | sudo tee /etc/systemd/system/$u
+#   done
+#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-sync.timer
+#
+# Status: systemctl status remote-browser-sync.service; log: journalctl -u remote-browser-sync.service
+# Exit status 2 (some group members skipped, e.g. a uid that is not a safe name) shows as failed on
+# purpose: fix the member or take it out of the group.
+[Unit]
+Description=Remote browser: provision browser containers from FreeIPA
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/sync-freeipa-users.py
+# Pulling an image or starting many browsers can take a while.
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+PrivateTmp=yes

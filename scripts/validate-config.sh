@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
-# Validate the rendered Docker Compose and Nginx configuration in throwaway containers.
+# Validate the rendered Docker Compose and Nginx configuration (including the generated user map) in
+# throwaway containers.
 # (Authelia is the site's existing instance; validate its configuration there.)
 # Exits non-zero on the first failure. Safe to run while the stack is up.
+#
+# Usage: ./scripts/validate-config.sh        ENV_FILE=demo/demo.env ./scripts/validate-config.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-compose_files=(-f compose.yaml)
-# Phase 2: the single test user, when configured in .env.
-grep -qE '^BROWSER_TEST_USER=.+' .env 2>/dev/null && compose_files+=(-f compose.browser-test.yaml)
-[[ -s generated/compose.users.yaml ]] && compose_files+=(-f generated/compose.users.yaml)
-dc() { docker compose "${compose_files[@]}" "$@"; }
+# The files docker compose uses: COMPOSE_FILE from .env (compose.yaml + the generated browsers),
+# otherwise compose.yaml alone.
+env_file="${ENV_FILE:-.env}"
+files="$(grep -E '^COMPOSE_FILE=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+compose_files=()
+IFS=: read -ra listed <<<"${files:-compose.yaml}"
+for f in "${listed[@]}"; do
+    if [[ -f "$f" ]]; then
+        compose_files+=(-f "$f")
+    elif [[ "$(basename "$f")" == compose.users.yaml ]]; then
+        echo "note: $f not generated yet (first sync), validating without browsers"
+    else
+        echo "$f (COMPOSE_FILE) is missing" >&2; exit 1
+    fi
+done
+dc() { docker compose --env-file "$env_file" "${compose_files[@]}" "$@"; }
 
 echo "== docker compose config (${compose_files[*]})"
 dc config --quiet

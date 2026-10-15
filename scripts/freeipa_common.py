@@ -1,4 +1,4 @@
-"""Shared FreeIPA access for validate-freeipa.py and (Phase 3) sync-freeipa-users.py.
+"""Shared FreeIPA access for validate-freeipa.py and sync-freeipa-users.py.
 
 Eligibility rules MUST match Authelia's `freeipa` LDAP implementation defaults, otherwise users
 get provisioned whom Authelia denies (or the reverse):
@@ -25,8 +25,8 @@ try:
     import ldap3
     from ldap3.core.exceptions import LDAPException, LDAPNoSuchObjectResult
     from ldap3.utils.dn import parse_dn
-except ImportError:  # pragma: no cover - environment problem, reported clearly
-    raise SystemExit("python3-ldap3 is required: apt install python3-ldap3")
+except ImportError:  # reported by connect(); the demo's file source and the unit tests need no LDAP
+    ldap3 = None
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 
@@ -176,6 +176,8 @@ def _tls(cfg: Config) -> ldap3.Tls:
 
 
 def connect(cfg: Config) -> ldap3.Connection:
+    if ldap3 is None:
+        raise FreeIPAError("python3-ldap3 is required: apt install python3-ldap3")
     try:
         server = ldap3.Server(cfg.ldap_url, use_ssl=True, tls=_tls(cfg),
                               get_info=ldap3.NONE, connect_timeout=cfg.timeout)
@@ -194,7 +196,7 @@ def _raw(entry: dict, attr: str) -> list[str]:
     return []
 
 
-def _search(conn: ldap3.Connection, base: str, flt: str, attrs: list[str], scope=ldap3.BASE) -> list[dict]:
+def _search(conn: ldap3.Connection, base: str, flt: str, attrs: list[str], scope: str = "BASE") -> list[dict]:
     try:
         conn.search(base, flt, search_scope=scope, attributes=attrs)
     except LDAPNoSuchObjectResult:

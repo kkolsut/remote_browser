@@ -1,0 +1,11 @@
+# Runs remote-browser-sync.service every 5 minutes: the longest a user who lost access keeps an open
+# stream (plan §16-17). Installation: see remote-browser-sync.service.
+[Unit]
+Description=Remote browser: provision browser containers from FreeIPA every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

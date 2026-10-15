@@ -113,7 +113,7 @@ Copy the IPA CA to the remote-browser VM (from any enrolled host, or `https://ip
 install -m 0644 ca.crt local/freeipa-ca/ipa-ca.crt     # FREEIPA_CA_DIR
 ```
 
-The Python scripts (`validate-freeipa.py`, later `sync-freeipa-users.py`) trust certificates in that
+The Python scripts (`validate-freeipa.py`, `sync-freeipa-users.py`) trust certificates in that
 directory. Your Authelia needs the same CA for its LDAPS connection. TLS verification is never disabled.
 
 ## 6. Verify

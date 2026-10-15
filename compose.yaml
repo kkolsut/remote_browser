@@ -5,9 +5,11 @@
 #                                                    |
 #                                                    +--authz--> Authelia (existing, LAN)
 #
-# Per-user browser services live in an extra Compose file:
-#   Phase 2: compose.browser-test.yaml (one hand-configured test user)
-#   Phase 3: generated/compose.users.yaml (scripts/sync-freeipa-users.py)
+# The per-user browser services and networks are generated from FreeIPA by
+# scripts/sync-freeipa-users.py into generated/compose.users.yaml (COMPOSE_FILE in .env). The sync also
+# attaches Nginx to each user's network, live: declaring those networks here would make Compose
+# recreate Nginx, dropping every open stream, whenever a user is added. Hence: after anything that
+# recreates Nginx (docker compose up -d after a change to it), run the sync.
 # The local demo adds its own Authelia and an Apache in front (compose.demo.yaml).
 
 name: remote-browser
@@ -52,5 +54,5 @@ services:
 networks:
   # The published port, and Nginx's way out to Authelia.
   frontend: {}
-  # Per-user browser networks (one per user, nginx attached to each) come with the browser services,
-  # from BROWSER_NET_POOL — never one shared network (plan §30).
+  # Per-user browser networks (one per user, nginx attached to each) come with the generated browser
+  # services, from BROWSER_NET_POOL — never one shared network (plan §30).
