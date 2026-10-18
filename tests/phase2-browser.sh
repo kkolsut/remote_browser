@@ -6,39 +6,40 @@
 # test (it does not need Nginx or Authelia).
 #
 # Environment:
-#   PROJECT          Compose project name (default: remote-browser)
-#   BROWSER_USER     the user whose browser is tested (service browser-<user>)
-#   SERVICE          Compose service instead (default: browser-$BROWSER_USER)
+#   BROWSER_USER     the user whose browser is tested (container browser-<user>)
+#   CONTAINER        container name instead (default: browser-$BROWSER_USER)
+#   UNIT             its systemd unit (default: $CONTAINER.service)
 #   EGRESS_TARGETS   extra "ip:port" targets that must be blocked, e.g. "192.168.1.10:8006 10.0.0.5:636"
 #                    (Proxmox, FreeIPA, ...). The host's addresses and private ranges are always tested.
 #   SKIP_RESTART=1   skip the container restart (persistence) part
 #   SMOKE=1          a new image in a throwaway container without Nginx or network
 #                    (scripts/update-browser-image.sh): skip the network and egress parts
 #
-# The restart closes any browser the user has open in that container.
+# The restart closes any browser the user has open in that container. Run as root (rootful Podman).
 set -uo pipefail
 
-PROJECT="${PROJECT:-remote-browser}"
-[[ -n "${SERVICE:-}${BROWSER_USER:-}" ]] || { echo "set BROWSER_USER (or SERVICE)" >&2; exit 2; }
-SERVICE="${SERVICE:-browser-$BROWSER_USER}"
+[[ -n "${CONTAINER:-}${BROWSER_USER:-}" ]] || { echo "set BROWSER_USER (or CONTAINER)" >&2; exit 2; }
+CONTAINER="${CONTAINER:-browser-$BROWSER_USER}"
+UNIT="${UNIT:-$CONTAINER.service}"
 
 pass=0 fail=0
 ok()  { echo "PASS  $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL  $1"; [[ -n "${2:-}" ]] && echo "      $2"; fail=$((fail + 1)); }
 check() { local name="$1"; shift; if "$@"; then ok "$name"; else bad "$name"; fi; }
 
-cid="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=$SERVICE")"
-[[ -n "$cid" && "$(wc -l <<<"$cid")" == 1 ]] || { echo "no running $SERVICE container in project $PROJECT" >&2; exit 1; }
+cid="$CONTAINER"
+[[ "$(podman container inspect --format '{{.State.Running}}' "$cid" 2>/dev/null)" == true ]] \
+    || { echo "no running container $cid" >&2; exit 1; }
 
-inspect() { docker inspect --format "$1" "$cid"; }
+inspect() { podman container inspect --format "$1" "$cid"; }
 env_of() { inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n "s/^$1=//p"; }
 BROWSER_USER="${BROWSER_USER:-$(env_of REMOTE_BROWSER_USER)}"
 PUID="$(env_of PUID)"
 PGID="$(env_of PGID)"
 
 # Commands as the session user, with the session's display and home.
-as_user() { docker exec -u "$PUID:$PGID" -e DISPLAY=:1 -e HOME=/config "$cid" "$@"; }
-as_root() { docker exec "$cid" "$@"; }
+as_user() { podman exec -u "$PUID:$PGID" -e DISPLAY=:1 -e HOME=/config "$cid" "$@"; }
+as_root() { podman exec "$cid" "$@"; }
 chooser_visible() { as_user xdotool search --onlyvisible --name '^Choose your browser$' >/dev/null 2>&1; }
 user_procs() { as_root pgrep -u "$PUID" -x "$1" >/dev/null; }
 # Wait up to $1 seconds for "$@" to succeed.
@@ -46,13 +47,12 @@ wait_for() { local t="$1"; shift; for ((i = 0; i < t * 2; i++)); do "$@" && retu
 not() { ! "$@"; }
 
 echo "== container ($BROWSER_USER, uid $PUID)"
-check "hostname is browser-$BROWSER_USER" test "$(inspect '{{.Config.Hostname}}')" == "browser-$BROWSER_USER"
+check "hostname is $CONTAINER" test "$(inspect '{{.Config.Hostname}}')" == "$CONTAINER"
 check "not privileged" test "$(inspect '{{.HostConfig.Privileged}}')" == false
 check "no published ports" test -z "$(inspect '{{range $p, $b := .NetworkSettings.Ports}}{{if $b}}{{$p}} {{end}}{{end}}')"
-check "no Docker socket mounted" not grep -q docker.sock <<<"$(inspect '{{range .Mounts}}{{.Source}} {{end}}')"
-# Checked in the kernel's view of the container (/proc/1/status), the same on Docker and Podman,
-# whose APIs report these options differently.
-status1="$(docker exec "$cid" cat /proc/1/status)"
+check "no container engine socket mounted" not grep -qE 'podman\.sock|docker\.sock' <<<"$(inspect '{{range .Mounts}}{{.Source}} {{end}}')"
+# Checked in the kernel's view of the container (/proc/1/status).
+status1="$(podman exec "$cid" cat /proc/1/status)"
 field() { awk -v k="$1:" '$1 == k { print $2 }' <<<"$status1"; }
 check "seccomp filter active (not unconfined)" test "$(field Seccomp)" == 2
 check "no-new-privileges set" test "$(field NoNewPrivs)" == 1
@@ -61,24 +61,19 @@ check "no-new-privileges set" test "$(field NoNewPrivs)" == 1
 capbnd="$(field CapBnd)"
 check "capability set exactly as configured (CapBnd=$capbnd)" test "$(( 0x${capbnd:-ffffffff} ))" == "$(( 0x400eb ))"
 check "process limit set" test "$(inspect '{{.HostConfig.PidsLimit}}')" -gt 0
-# Docker reports log options in .HostConfig.LogConfig.Config, Podman's Docker API does not: ask its own.
-log_size="$(inspect '{{index .HostConfig.LogConfig.Config "max-size"}}')"
-if [[ -z "$log_size" && "$(docker version --format '{{range .Server.Components}}{{.Name}} {{end}}' 2>/dev/null)" == *Podman* ]]; then
-    log_size="$(curl -s --unix-socket "${DOCKER_HOST#unix://}" "http://d/v5.0.0/libpod/containers/$cid/json" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["HostConfig"]["LogConfig"].get("Size") or "")')"
-fi
-check "log rotation set (${log_size:-none})" test -n "$log_size"
+# journald rotates (and caps) the container's log, not a file that grows in the container store.
+log_driver="$(inspect '{{.HostConfig.LogConfig.Type}}')"
+check "logs to journald (got ${log_driver:-none})" test "$log_driver" == journald
 if [[ "${SMOKE:-0}" != 1 ]]; then
     networks="$(inspect '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}')"
     check "attached to exactly one network" test "$(wc -w <<<"$networks")" == 1
     net="${networks%% *}"
-    members="$(docker network inspect --format '{{range .Containers}}{{.Name}} {{end}}' "$net")"
-    check "its network holds only this browser and nginx" test "$(wc -w <<<"$members")" == 2 -a -n "$(grep -o "${PROJECT}-nginx-1" <<<"$members")"
+    members="$(podman network inspect --format '{{range .Containers}}{{.Name}} {{end}}' "$net")"
+    check "its network holds only this browser and nginx" test "$(wc -w <<<"$members")" == 2 -a -n "$(grep -ow rb-nginx <<<"$members")"
     # Nginx reaches Authelia over its default route; through a browser network it would be egress-filtered.
-    nginx_cid="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=nginx")"
-    front_gw="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "${PROJECT}_frontend")"
-    # The route actually used (Docker: gw_priority; Podman: the frontend network's lower metric).
-    nginx_gw="$(docker exec "$nginx_cid" ip route get 1.1.1.1 2>&1 | sed -n 's/.* via \([0-9.]*\) .*/\1/p')"
+    front_gw="$(podman network inspect --format '{{range .Subnets}}{{.Gateway}}{{end}}' rb-frontend)"
+    # The route actually used: the frontend network's lower metric (rb-frontend.network).
+    nginx_gw="$(podman exec rb-nginx ip route get 1.1.1.1 2>&1 | sed -n 's/.* via \([0-9.]*\) .*/\1/p')"
     check "nginx's default route is the frontend network (via ${nginx_gw:-none})" test -n "$front_gw" -a "$nginx_gw" == "$front_gw"
 fi
 
@@ -90,7 +85,7 @@ check "launcher runs as the session user" wait_for 60 launcher_running
 check "no browser-launcher runs as root" not as_root pgrep -u 0 -f /usr/local/bin/browser-launcher
 check "no sudo in the image" not as_root sh -c 'command -v sudo'
 groups="$(as_user id -Gn 2>/dev/null)"
-check "session user not in sudo/docker groups" not grep -qwE 'sudo|docker' <<<"$groups"
+check "session user not in sudo/docker/wheel groups" not grep -qwE 'sudo|docker|wheel' <<<"$groups"
 
 echo "== chooser"
 check "chooser visible at session start" wait_for 30 chooser_visible
@@ -148,7 +143,7 @@ if [[ "${SKIP_RESTART:-0}" != 1 ]]; then
     press c
     wait_for 40 user_procs chrome
     sleep 5
-    docker restart "$cid" >/dev/null
+    systemctl restart "$UNIT"
     check "chooser returns after container restart" wait_for 90 chooser_visible
     check "Chrome marker survived" as_user grep -q rb-test /config/.config/google-chrome/rb-persistence-marker
     check "Firefox marker survived" as_user sh -c 'cat /config/.mozilla/firefox/*/rb-persistence-marker /config/.config/mozilla/firefox/*/rb-persistence-marker 2>/dev/null | grep -q rb-test'
@@ -170,7 +165,7 @@ if [[ "${SMOKE:-0}" != 1 ]]; then
         if grep -q 'No route to host' <<<"$out"; then ok "blocked: $target"
         else bad "blocked: $target" "${out:-connected}"; fi
     }
-    gateway="$(docker network inspect --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$net")"
+    gateway="$(podman network inspect --format '{{range .Subnets}}{{.Gateway}}{{end}}' "$net")"
     host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
     for target in "$gateway:22" "${host_ip:-}:22" 10.0.0.1:80 172.16.0.1:80 192.168.0.1:80 100.64.0.1:80 169.254.169.254:80 ${EGRESS_TARGETS:-}; do
         [[ "$target" == :* ]] && continue

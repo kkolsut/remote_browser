@@ -34,17 +34,18 @@ services:
       # Only these variables are substituted into nginx/templates/*.template.
       NGINX_ENVSUBST_FILTER: "^(PUBLIC_HOST|AUTHELIA_HOST|PUBLIC_PORT|AUTHELIA_AUTHZ_URL|AUTHELIA_CA_FILE|TRUSTED_PROXY|NGINX_LOCAL_RESOLVERS)$$"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/templates:/etc/nginx/templates:ro
-      - ./nginx/snippets:/etc/nginx/snippets:ro
-      - ./nginx/html:/usr/share/nginx/remote-browser:ro
+      # z: shared SELinux label (RHEL-family hosts); no effect without SELinux.
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./nginx/templates:/etc/nginx/templates:ro,z
+      - ./nginx/snippets:/etc/nginx/snippets:ro,z
+      - ./nginx/html:/usr/share/nginx/remote-browser:ro,z
       # User -> browser map files (*.map), see nginx.conf. Empty = nobody has a browser.
-      - ${NGINX_GENERATED_DIR:-./nginx/generated}:/etc/nginx/generated:ro
+      - ${NGINX_GENERATED_DIR:-./nginx/generated}:/etc/nginx/generated:ro,z
       # Certificate presented to the reverse proxy, which pins it (docs/apache-authelia.md).
-      - ${TLS_DIR:-./local/tls}:/etc/nginx/tls:ro
+      - ${TLS_DIR:-./local/tls}:/etc/nginx/tls:ro,z
       # CA certificate(s) for an https:// AUTHELIA_AUTHZ_URL signed by a private CA
       # (then AUTHELIA_CA_FILE=/etc/nginx/authelia-ca/<file>).
-      - ${AUTHELIA_CA_DIR:-./local/authelia-ca}:/etc/nginx/authelia-ca:ro
+      - ${AUTHELIA_CA_DIR:-./local/authelia-ca}:/etc/nginx/authelia-ca:ro,z
     networks:
       frontend:
         # Nginx also sits on every per-user browser network, whose traffic to the LAN is rejected

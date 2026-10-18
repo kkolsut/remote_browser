@@ -2,7 +2,7 @@
 
 ```text
 client ──HTTPS──▶ Apache (existing)  ──HTTPS, pinned cert──▶ Nginx (browser VM :HTTPS_PORT) ──▶ browser-<uid>
-                  browser.example.com                          │  per-user Docker networks
+                  browser.example.com                          │  per-user Podman networks
                   auth.example.com ──▶ Authelia (existing)     │
                                           ▲                    │
                                           └──── authz (LAN) ───┘
@@ -16,7 +16,7 @@ client ──HTTPS──▶ Apache (existing)  ──HTTPS, pinned cert──▶
 - **Authelia** (yours) checks the FreeIPA password and the group, and serves the login portal as today.
 
 The per-user routing has to happen on the VM: the browser containers are reachable only on per-user
-Docker networks there, and Selkies has no authentication of its own.
+Podman networks there, and Selkies has no authentication of its own.
 
 ## 1. Authelia
 
@@ -148,7 +148,8 @@ What the vhost does (`apache/remote-browser.conf`):
 - WebSockets through to the VM (`upgrade=websocket`, 1 h timeout): the Selkies stream.
 - Sets `X-Forwarded-Proto`; drops client-supplied `Remote-*` headers (Nginx overwrites them anyway).
 
-The local demo (`./scripts/demo.sh`) runs this same file in an Apache container, so it is tested.
+In this homelab, web01's vhost is rendered by Ansible from the same rules
+(`roles/web-server/templates/vhosts/browser.kolsut.net.conf.j2`).
 
 ## 3. The VM
 
@@ -166,7 +167,7 @@ Nginx closes connections from any other address than `TRUSTED_PROXY` without an 
 `HTTPS_PORT` to Apache in the VM firewall as well. If Apache reaches the VM through NAT, `TRUSTED_PROXY`
 is the address the VM sees.
 
-Nginx's default route must be its `frontend` network (`gw_priority`, Docker Engine 28 or newer). Through a
+Nginx's default route must be its `rb-frontend` network (route metric 50, `rb-frontend.network`). Through a
 browser network, its requests to Authelia would be rejected by the egress filter.
 `tests/phase2-browser.sh` checks this.
 

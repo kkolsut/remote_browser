@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Create host directories and generate deployment secrets. Idempotent: existing secrets are never
-# overwritten. Runs as an ordinary user; directories and secrets are owned by whoever runs it.
-# Authelia secrets are created only for a bundled Authelia (AUTHELIA_DATA_DIR set: the local demo);
-# production uses the site's existing Authelia.
-# Relative paths in .env are resolved against the repository directory (as Docker Compose does).
+# Create host directories and the FreeIPA bind password file. Idempotent: existing secrets are never
+# overwritten. Directories and secrets are owned by whoever runs it (root in production).
+# Relative paths in .env are resolved against the repository directory.
 #
-# Usage: ./scripts/init-secrets.sh [--self-signed-tls]
-#        ENV_FILE=demo/demo.env ./scripts/init-secrets.sh ...   (another env file)
+# Usage: sudo ./scripts/init-secrets.sh [--self-signed-tls]
+#   The bind password is asked for, or read from standard input when that is not a terminal
+#   (printf '%s' "$PW" | sudo ./scripts/init-secrets.sh).
 #
 #   --self-signed-tls   also create a self-signed certificate for PUBLIC_HOST (+ AUTHELIA_HOST) in
 #                       TLS_DIR, valid 10 years: the certificate Nginx presents to the reverse proxy,
@@ -20,7 +19,7 @@ self_signed=0
 for arg in "$@"; do
     case "$arg" in
         --self-signed-tls) self_signed=1 ;;
-        -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -35,7 +34,7 @@ env_get() {
     echo "${value:-$2}"
 }
 
-# Absolute path; relative values are taken relative to the repository, like compose.yaml bind mounts.
+# Absolute path; relative values are taken relative to the repository.
 env_path() {
     local value
     value="$(env_get "$1" "$2")"
@@ -47,30 +46,13 @@ secrets_dir="$(env_path SECRETS_DIR ./local/secrets)"
 tls_dir="$(env_path TLS_DIR ./local/tls)"
 ca_dir="$(env_path FREEIPA_CA_DIR ./local/freeipa-ca)"
 authelia_ca_dir="$(env_path AUTHELIA_CA_DIR ./local/authelia-ca)"
-bundled_authelia="$(env_get AUTHELIA_DATA_DIR '')"
 user_data="$(env_path USER_DATA_ROOT ./local/users)"
 public_host="$(env_get PUBLIC_HOST '')"
 authelia_host="$(env_get AUTHELIA_HOST '')"
 
 install -d -m 0700 "$secrets_dir" || { echo "cannot create directories; use paths you can write to in .env (e.g. ./local/...)" >&2; exit 1; }
 install -d -m 0755 "$tls_dir" "$ca_dir" "$authelia_ca_dir" "$user_data"
-[[ -n "$bundled_authelia" ]] && install -d -m 0700 "$(env_path AUTHELIA_DATA_DIR '')"
-
-gen_secret() {
-    local file="$secrets_dir/$1"
-    if [[ -s "$file" ]]; then
-        echo "keep     $file"
-    else
-        (umask 077; openssl rand -hex 64 | tr -d '\n' > "$file")
-        echo "created  $file"
-    fi
-}
-
-if [[ -n "$bundled_authelia" ]]; then
-    gen_secret authelia_session_secret
-    gen_secret authelia_storage_encryption_key
-    gen_secret authelia_reset_password_jwt_secret
-fi
+install -d -m 0755 "$(env_path GENERATED_DIR ./generated)" "$(env_path NGINX_GENERATED_DIR ./nginx/generated)"
 
 bind_pw_file="$secrets_dir/freeipa_bind_password"
 if [[ "$(env_get AUTH_BACKEND freeipa)" == file ]]; then
@@ -78,7 +60,11 @@ if [[ "$(env_get AUTH_BACKEND freeipa)" == file ]]; then
 elif [[ -s "$bind_pw_file" ]]; then
     echo "keep     $bind_pw_file"
 else
-    read -r -s -p "FreeIPA bind password for $(env_get FREEIPA_BIND_DN '?'): " bind_pw; echo
+    if [[ -t 0 ]]; then
+        read -r -s -p "FreeIPA bind password for $(env_get FREEIPA_BIND_DN '?'): " bind_pw; echo
+    else
+        bind_pw="$(cat)"
+    fi
     [[ -n "$bind_pw" ]] || { echo "empty password" >&2; exit 1; }
     (umask 077; printf '%s' "$bind_pw" > "$bind_pw_file")
     unset bind_pw

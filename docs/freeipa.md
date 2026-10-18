@@ -14,7 +14,7 @@ ipa group-add-member remote-browser-users --users=alice,bob
 which sees only direct members; the provisioning sync applies the same rule. Members reached through a nested
 group are ignored, not partially enabled.
 
-Usernames must match `^[a-z][a-z0-9-]{0,30}$` (no dots or underscores), because they become Docker service,
+Usernames must match `^[a-z][a-z0-9-]{0,30}$` (no dots or underscores), because they become container, unit,
 network and DNS names. Non-matching members are reported by `validate-freeipa.py` and never provisioned.
 
 ## 2. Test accounts

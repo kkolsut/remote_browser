@@ -4,7 +4,7 @@
 #   2. a profile changed afterwards comes back exactly by scripts/restore.sh --users, the changed one
 #      is kept aside, the browser runs again with its Chrome and Firefox profiles;
 #   3. scripts/restore.sh --config recreates .env, secrets and generated state in a fresh checkout.
-# Needs the same rights as the scripts (root in production).
+# Run as root, like the scripts.
 #
 # Environment:
 #   ENV_FILE       env file of the stack (default: .env)
@@ -18,7 +18,6 @@ env_get() {
     [[ "${3:-}" == path && "$v" != /* ]] && v="$repo_dir/${v#./}"
     echo "$v"
 }
-PROJECT="$(env_get COMPOSE_PROJECT_NAME remote-browser)"
 USER_DATA_ROOT="$(env_get USER_DATA_ROOT ./local/users path)"
 BACKUP_DIR="$(env_get BACKUP_DIR ./local/backups path)"
 STATE="$(env_get GENERATED_DIR ./generated path)/state.json"
@@ -30,12 +29,12 @@ bad() { echo "FAIL  $1"; [[ -n "${2:-}" ]] && echo "      $2"; fail=$((fail + 1)
 check() { local name="$1"; shift; if "$@"; then ok "$name"; else bad "$name"; fi; }
 not() { ! "$@"; }
 
-cid_of() { docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=browser-$1"; }
-cid="$(cid_of "$BROWSER_USER")"
-[[ -n "$cid" ]] || { echo "browser-$BROWSER_USER is not running" >&2; exit 1; }
-puid="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" | sed -n 's/^PUID=//p')"
-pgid="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" | sed -n 's/^PGID=//p')"
-as_user() { docker exec -u "$puid:$pgid" "$1" sh -c "$2"; }
+cid="browser-$BROWSER_USER"
+state() { podman container inspect --format '{{.State.Status}}' "$cid" 2>/dev/null; }
+[[ "$(state)" == running ]] || { echo "$cid is not running" >&2; exit 1; }
+puid="$(podman container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" | sed -n 's/^PUID=//p')"
+pgid="$(podman container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" | sed -n 's/^PGID=//p')"
+as_user() { podman exec -u "$puid:$pgid" "$1" sh -c "$2"; }
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -60,7 +59,7 @@ users_list="$(tar -tzf "$backup/users/$BROWSER_USER.tar.gz")"
 check "profile archive has the marker" grep -qx "$BROWSER_USER/config/rb-backup-marker" <<<"$users_list"
 check "profile archive has the Chrome profile" grep -q "^$BROWSER_USER/config/.config/google-chrome/" <<<"$users_list"
 check "profile archive has no caches" not grep -q '/\.cache/\|/cache2/\|/Cache/' <<<"$users_list"
-check "browser running again (not left paused)" test "$(docker inspect --format '{{.State.Status}}' "$cid")" == running
+check "browser running again (not left paused)" test "$(state)" == running
 
 echo "== restore a profile"
 as_user "$cid" 'rm -f /config/rb-backup-marker; echo junk > /config/rb-after-backup'
@@ -70,8 +69,8 @@ else bad "restore.sh --users runs" "$(tail -n 5 "$work/restore.log")"; fi
 aside="$(find "$USER_DATA_ROOT" -maxdepth 1 -name "$BROWSER_USER.before-restore-*" | sort | tail -n1)"
 check "the replaced profile is kept aside" test -f "$aside/config/rb-after-backup"
 check "restored profile owned by the user, mode 0700" test "$(stat -c '%u %a' "$USER_DATA_ROOT/$BROWSER_USER")" == "$puid 700"
-cid="$(cid_of "$BROWSER_USER")"
-check "browser running after the restore" test -n "$cid"
+for _ in $(seq 30); do [[ "$(state)" == running ]] && break; sleep 1; done
+check "browser running after the restore" test "$(state)" == running
 check "marker back" as_user "$cid" 'grep -q rb-backup-test /config/rb-backup-marker'
 check "later file gone" as_user "$cid" 'test ! -e /config/rb-after-backup'
 check "Chrome and Firefox profiles back" as_user "$cid" \
@@ -85,9 +84,11 @@ rm -rf "$aside"
 echo "== restore the configuration into a fresh checkout"
 fresh="$work/checkout"
 mkdir -p "$fresh"
-git -C "$repo_dir" ls-files -z --cached --others --exclude-standard |(cd "$repo_dir" && xargs -0 cp --parents -t "$fresh")
+# The application files without any local state, as Ansible (or git clone) would put them on a new VM.
+tar -C "$repo_dir" --exclude=./local --exclude=./.env --exclude='./generated/*' --exclude='./nginx/generated/*' \
+    --exclude=__pycache__ -cf - . | tar -C "$fresh" -xf -
 env_rel="${ENV_FILE#"$repo_dir"/}"
-[[ "$env_rel" != /* ]] && rm -f "$fresh/$env_rel"   # tracked demo env: it must come from the backup
+rm -f "$fresh/$env_rel"   # it must come from the backup
 if ENV_FILE="$fresh/$env_rel" "$fresh/scripts/restore.sh" "$backup" --config > "$work/restore-config.log" 2>&1; then
     ok "restore.sh --config runs"
 else bad "restore.sh --config runs" "$(tail -n 5 "$work/restore-config.log")"; fi

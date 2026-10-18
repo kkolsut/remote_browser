@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Egress filter for the browser containers (plan §30a), for Docker and Podman alike: its own nftables
-# table, independent of the engine's rules. Browser networks are /28s from BROWSER_NET_POOL; traffic
+# Egress filter for the browser containers (plan §30a): its own nftables table, independent of
+# Podman's (netavark's) and firewalld's rules. Browser networks are /28s from BROWSER_NET_POOL; traffic
 # from that pool may reach the public Internet only:
 #
 #   to the host itself (any port, any address), except DNS to its network's gateway   REJECT (input)
@@ -9,19 +9,18 @@
 #   replies; Nginx <-> browser within the user's own /28                              allowed
 #   everything else (public Internet)                                                 allowed
 #
-# A reject in any nftables base chain is final, whatever Docker's or netavark's chains accept.
+# A reject in any nftables base chain is final, whatever netavark's or firewalld's chains accept.
 # REJECT (icmp admin-prohibited) instead of DROP: blocked connections fail at once with "No route to
 # host" instead of hanging, which is what tests/phase2-browser.sh checks for.
-# DNS: Docker's embedded resolver answers inside the container; Podman's aardvark-dns listens on each
-# network's gateway, i.e. on the host, hence the one input exception.
+# DNS: Podman's aardvark-dns listens on each network's gateway, i.e. on the host, hence the one input
+# exception.
 #
 # Usage: sudo ./scripts/egress-firewall.sh apply|remove|status
-#        sudo ENV_FILE=demo/demo.env ./scripts/egress-firewall.sh apply   (another env file)
 #
-# Root, rootful Docker or Podman. At boot before the containers start: systemd/remote-browser-egress.service.
-# If something flushes the whole ruleset (e.g. restarting Debian's nftables.service, whose
-# /etc/nftables.conf starts with "flush ruleset"), apply again. IPv4 only: the browser networks have
-# no IPv6.
+# Root. At boot before the containers start: systemd/remote-browser-egress.service, which every browser
+# unit requires. If something flushes the whole ruleset (e.g. restarting nftables.service with an
+# /etc/sysconfig/nftables.conf that starts with "flush ruleset"), apply again. IPv4 only: the browser
+# networks have no IPv6.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -54,16 +53,6 @@ if pool.prefixlen > 28:
     sys.exit("BROWSER_NET_POOL must be /28 or larger")
 print(", ".join(f"{n} . {n}" for n in pool.subnets(new_prefix=28)))
 PY
-}
-
-# The iptables rules of earlier versions of this script (Docker's DOCKER-USER chain).
-remove_legacy() {
-    command -v iptables >/dev/null || return 0
-    while iptables -w -C DOCKER-USER -s "$pool" -j RB-EGRESS 2>/dev/null; do iptables -w -D DOCKER-USER -s "$pool" -j RB-EGRESS; done
-    while iptables -w -C INPUT -s "$pool" -j RB-INPUT 2>/dev/null; do iptables -w -D INPUT -s "$pool" -j RB-INPUT; done
-    for chain in RB-EGRESS RB-INPUT; do
-        if iptables -w -L "$chain" -n >/dev/null 2>&1; then iptables -w -F "$chain"; iptables -w -X "$chain"; fi
-    done
 }
 
 apply() {
@@ -104,13 +93,11 @@ table $table {
     }
 }
 EOF
-    remove_legacy
     echo "egress filter active for $pool"
 }
 
 remove() {
     nft delete table $table 2>/dev/null || true
-    remove_legacy
 }
 
 case "${1:-}" in
@@ -123,5 +110,5 @@ case "${1:-}" in
         else
             echo "egress filter NOT active for $pool"; exit 1
         fi ;;
-    *) sed -n '2,24p' "$0"; exit 2 ;;
+    *) sed -n '2,22p' "$0"; exit 2 ;;
 esac

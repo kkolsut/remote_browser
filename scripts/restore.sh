@@ -10,14 +10,13 @@
 #
 # Run as root. Afterwards run the sync: it recreates the browsers of eligible users.
 #
-# Usage: ./scripts/restore.sh <backup dir> --config [--force]
-#        ./scripts/restore.sh <backup dir> --users [uid ...]
-#        ENV_FILE=demo/demo.env ./scripts/restore.sh ...
+# Usage: sudo ./scripts/restore.sh <backup dir> --config [--force]
+#        sudo ./scripts/restore.sh <backup dir> --users [uid ...]
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 env_file="$(realpath -m "${ENV_FILE:-$repo_dir/.env}")"
-usage() { sed -n '2,15p' "$0" >&2; exit 2; }
+usage() { sed -n '2,14p' "$0" >&2; exit 2; }
 
 backup="${1:-}"; shift || true
 [[ -n "$backup" && -f "$backup/SHA256SUMS" ]] || { echo "not a backup directory: ${backup:-?}" >&2; usage; }
@@ -44,7 +43,7 @@ if [[ "$mode" == config ]]; then
     fi
     tar -C "$repo_dir" -xzf "$backup/config.tar.gz" --numeric-owner --same-permissions
     [[ -f "$backup/config-abs.tar.gz" ]] && tar -C / -xzf "$backup/config-abs.tar.gz" --numeric-owner --same-permissions
-    echo "configuration restored into $repo_dir. Next: docker compose up -d nginx, then the profiles"
+    echo "configuration restored into $repo_dir. Next: ./scripts/install-units.py, then the profiles"
     exit 0
 fi
 
@@ -54,7 +53,6 @@ env_get() {
     echo "$v"
 }
 [[ -f "$env_file" ]] || { echo "missing $env_file: restore --config first" >&2; exit 1; }
-project="$(env_get COMPOSE_PROJECT_NAME remote-browser)"
 user_root="$(env_get USER_DATA_ROOT ./local/users path)"
 mkdir -p "$user_root"
 
@@ -66,15 +64,16 @@ for uid in "${uids[@]}"; do
     [[ "$uid" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "invalid uid: $uid" >&2; exit 2; }
     archive="$backup/users/$uid.tar.gz"
     [[ -f "$archive" ]] || { echo "no profile of $uid in this backup" >&2; exit 1; }
-    cid="$(docker ps -q --filter "label=com.docker.compose.project=$project" \
-        --filter "label=com.docker.compose.service=browser-$uid")"
-    [[ -n "$cid" ]] && docker stop -t 10 "$cid" >/dev/null && echo "  stopped browser-$uid"
+    was_running=0
+    if systemctl is-active --quiet "browser-$uid.service"; then
+        systemctl stop "browser-$uid.service" && was_running=1 && echo "  stopped browser-$uid"
+    fi
     if [[ -e "$user_root/$uid" ]]; then
         mv "$user_root/$uid" "$user_root/$uid.before-restore-$stamp"
         echo "  $uid: current profile moved to $uid.before-restore-$stamp"
     fi
     tar -C "$user_root" -xzf "$archive" --numeric-owner --same-permissions
     echo "  $uid: restored"
-    [[ -n "$cid" ]] && docker start "$cid" >/dev/null && echo "  started browser-$uid"
+    (( was_running )) && systemctl start "browser-$uid.service" && echo "  started browser-$uid"
 done
 echo "done. Run the sync to (re)create browsers of eligible users."

@@ -35,6 +35,24 @@ command -v docker >/dev/null && note "docker CLI: $(docker --version)" \
 docker compose version >/dev/null 2>&1 && note "$(docker compose version)" || fail "docker compose plugin missing"
 command -v nft >/dev/null && note "nftables $(nft --version | awk '{print $2}')" || fail "nft missing (scripts/egress-firewall.sh)"
 command -v python3 >/dev/null || fail "python3 missing"
+if [[ "$(env_get AUTH_BACKEND)" != file ]]; then
+    python3 -c 'import ldap3' 2>/dev/null && note "python3-ldap3" \
+        || fail "python3-ldap3 missing (RHEL family: EPEL, dnf install python3-ldap3)"
+fi
+if command -v podman-docker >/dev/null || [[ "$(readlink -f "$(command -v docker 2>/dev/null)")" == */podman ]]; then
+    fail "'docker' is Podman's emulation (podman-docker): remove it and install docker-ce-cli"
+fi
+# The browser sandboxes create unprivileged user namespaces.
+userns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)"
+(( userns > 0 )) && note "user namespaces allowed (max $userns)" \
+    || fail "user.max_user_namespaces is 0: the browser sandboxes need user namespaces (sysctl)"
+if command -v getenforce >/dev/null; then
+    mode="$(getenforce)"
+    note "SELinux $mode (volumes carry :z/:Z labels)"
+    [[ "$mode" == Disabled ]] || rpm -q container-selinux >/dev/null 2>&1 || fail "container-selinux missing"
+fi
+systemctl is-active --quiet firewalld 2>/dev/null \
+    && note "firewalld active: allow HTTPS_PORT only from Apache (docs/podman-rhel.md)"
 
 echo "== docker CLI -> Podman"
 if (( EUID == 0 )); then

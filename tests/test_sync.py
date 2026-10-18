@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/sync-freeipa-users.py (plan §56): fail-safe behaviour, eligibility, generated
-files, removal guard, subnet allocation, apply order. LDAP and Docker are faked; the generated Compose
-file is also checked by the real `docker compose config` when Docker is available.
+files and units, removal guard, subnet allocation, apply order. LDAP, Podman and systemd are faked; the
+generated units are also checked by Podman's real Quadlet generator when it is installed.
 
     python3 tests/test_sync.py      (or: python3 -m unittest discover -s tests -p 'test_*.py')
 """
@@ -16,7 +16,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,74 +37,95 @@ MAP_LINE = re.compile(r'^"([a-z][a-z0-9-]{0,30})" "browser-\1:3000";$')
 
 
 def args(**kw) -> argparse.Namespace:
-    return argparse.Namespace(**{"dry_run": False, "generate_only": False, "force": False, **kw})
+    return argparse.Namespace(**{"dry_run": False, "generate_only": False, "attach_only": False, "force": False,
+                                 **kw})
 
 
 def cand(uid, uid_number=ME, gid_number=MY_GID, source=None):
     return sync.Candidate(uid, uid_number, gid_number, source or f"uid={uid},cn=users,cn=accounts,dc=x")
 
 
-class FakeDocker:
-    """Records actions; models the project from the files the sync generates."""
+def parse_unit(text: str) -> dict[str, dict[str, list[str]]]:
+    """Quadlet file -> {section: {key: [values]}} (keys may repeat)."""
+    result: dict[str, dict[str, list[str]]] = {}
+    section = None
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = result.setdefault(line.strip("[]"), {})
+        else:
+            key, value = line.split("=", 1)
+            section.setdefault(key, []).append(value)
+    return result
+
+
+class FakePodman:
+    """Records actions; models networks and containers from the units the sync installs."""
 
     def __init__(self, settings, other_subnets=()):
         self.s = settings
         self.actions: list[tuple] = []
-        self.nets: dict[str, dict] = {}  # docker name -> network
-        self.containers: dict[str, str] = {}  # id -> service
-        self.nginx = "nginx-id"
+        self.nets: dict[str, dict] = {}  # name -> network
+        self.running: set[str] = set()  # running units
+        self.nginx = True
         self.nginx_ok = True
+        self.reject = None
         for i, subnet in enumerate(other_subnets):
-            self.nets[f"other{i}"] = {"name": f"other{i}", "project": None, "key": None,
-                                      "subnets": [subnet], "containers": []}
+            self.nets[f"other{i}"] = {"name": f"other{i}", "user": None, "subnets": [subnet], "containers": []}
 
-    def model(self, files):
-        import yaml
-        generated = yaml.safe_load(Path(files[-1]).read_text())
-        return {"services": {"nginx": {}, **(generated.get("services") or {})},
-                "networks": {"frontend": {}, **(generated.get("networks") or {})}}
+    def validate(self, units):
+        if self.reject:
+            raise sync.EngineError(self.reject)
 
     def networks(self):
-        return [dict(n) for n in self.nets.values()]
+        return [dict(n, containers=list(n["containers"])) for n in self.nets.values()]
 
-    def project_containers(self):
-        return list(self.containers.items())
-
-    def running_nginx(self):
+    def nginx_running(self):
         return self.nginx
 
-    def remove_container(self, cid):
-        self.actions.append(("remove", self.containers.pop(cid)))
-        for n in self.nets.values():
-            if cid in n["containers"]:
-                n["containers"].remove(cid)
-
-    def nginx_test(self, cid):
+    def nginx_test(self):
         self.actions.append(("nginx -t",))
         return self.nginx_ok, "" if self.nginx_ok else "bad config"
 
-    def nginx_reload(self, cid):
+    def nginx_reload(self):
         self.actions.append(("reload",))
 
-    def up(self, services):
-        self.actions.append(("up", tuple(services)))
-        model = self.model(self.s.compose_files)
-        for svc in services:
-            self.containers.setdefault(f"id-{svc}", svc)
-        for key, net in model["networks"].items():
-            name = f"{self.s.project}_{key}"
-            if key.startswith("net-") and name not in self.nets:
-                subnet = net["ipam"]["config"][0]["subnet"]
-                self.nets[name] = {"name": name, "project": self.s.project, "key": key, "subnets": [subnet],
-                                   "containers": [f"id-browser-{key[4:]}"]}
+    def daemon_reload(self):
+        self.actions.append(("daemon-reload",))
 
-    def connect(self, network, cid):
+    def stop(self, units):
+        self.actions.append(("stop", tuple(units)))
+        for unit in units:
+            self.running.discard(unit)
+            if unit.startswith("browser-"):
+                for n in self.nets.values():
+                    if unit[:-8] in n["containers"]:
+                        n["containers"].remove(unit[:-8])
+
+    def try_restart(self, units):
+        self.actions.append(("try-restart", tuple(units)))
+
+    def start(self, units):
+        self.actions.append(("start", tuple(units)))
+        for unit in units:
+            uid = unit.removeprefix("browser-").removeprefix("rb-net-").removesuffix(".service").removesuffix("-network")
+            unit_file = self.s.quadlet_dir / f"rb-net-{uid}.network"
+            name = f"rb-net-{uid}"
+            if name not in self.nets and unit_file.exists():
+                subnet = parse_unit(unit_file.read_text())["Network"]["Subnet"][0]
+                self.nets[name] = {"name": name, "user": uid, "subnets": [subnet], "containers": []}
+            if unit.startswith("browser-") and name in self.nets and f"browser-{uid}" not in self.nets[name]["containers"]:
+                self.nets[name]["containers"].append(f"browser-{uid}")
+            self.running.add(unit)
+
+    def connect(self, network):
         self.actions.append(("connect", network))
-        self.nets[network]["containers"].append(cid)
+        self.nets[network]["containers"].append("rb-nginx")
 
-    def disconnect(self, network, cid):
+    def disconnect(self, network):
         self.actions.append(("disconnect", network))
-        self.nets[network]["containers"].remove(cid)
+        self.nets[network]["containers"].remove("rb-nginx")
 
     def remove_network(self, network):
         self.actions.append(("rm network", network))
@@ -119,21 +139,20 @@ class SyncTest(unittest.TestCase):
         self.env = self.tmp / "test.env"
         self.write_env()
         self.settings = sync.load_settings(self.env)
-        self.docker = FakeDocker(self.settings)
+        self.engine = FakePodman(self.settings)
 
     def write_env(self, **extra):
         values = {
             # Every test user has this process's uid (so no root is needed to create their profile
-            # directories); only the file backend (the demo) allows shared uidNumbers. The FreeIPA
+            # directories); only the file backend (tests) allows shared uidNumbers. The FreeIPA
             # path is tested through ldap_candidates and select_users.
             "AUTH_BACKEND": "file",
             "DEMO_UID": str(ME),
             "DEMO_GID": str(MY_GID),
-            "COMPOSE_PROJECT_NAME": "rb-unit",
+            "QUADLET_DIR": str(self.tmp / "quadlet"),
             "GENERATED_DIR": str(self.tmp / "generated"),
             "NGINX_GENERATED_DIR": str(self.tmp / "nginx"),
             "USER_DATA_ROOT": str(self.tmp / "users"),
-            "COMPOSE_FILE": f"compose.yaml:{self.tmp / 'generated' / 'compose.users.yaml'}",
             "BROWSER_NET_POOL": "10.213.0.0/16",
             "BROWSER_IMAGE": "local/remote-dual-browser:test",
             "PUBLIC_HOST": "browser.example.com",
@@ -145,7 +164,7 @@ class SyncTest(unittest.TestCase):
         self.env.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
 
     def sync_run(self, candidates, **kw) -> int:
-        return sync.run(self.settings, args(**kw), docker=self.docker, candidates=candidates)
+        return sync.run(self.settings, args(**kw), engine=self.engine, candidates=candidates)
 
     def snapshot(self) -> dict:
         return {p.relative_to(self.tmp): p.read_bytes() for p in sorted(self.tmp.rglob("*"))
@@ -165,7 +184,7 @@ class SyncTest(unittest.TestCase):
     def test_ldap_errors_abort_without_changes(self):
         self.assertEqual(self.sync_run([cand("alice")]), 0)
         before = self.snapshot()
-        actions = len(self.docker.actions)
+        actions = len(self.engine.actions)
         for message in ("LDAP connect/bind failed: unreachable", "LDAP connect/bind failed: invalidCredentials",
                         "group not found or not readable", "LDAP search failed: sizeLimitExceeded"):
             def broken(_settings, message=message):
@@ -174,11 +193,11 @@ class SyncTest(unittest.TestCase):
             sync.ldap_candidates = broken
             try:
                 with self.assertRaises(sync.SyncError):
-                    sync.run(dataclasses.replace(self.settings, backend="freeipa"), args(), docker=self.docker)
+                    sync.run(dataclasses.replace(self.settings, backend="freeipa"), args(), engine=self.engine)
             finally:
                 sync.ldap_candidates = orig
             self.assertEqual(self.snapshot(), before, message)
-            self.assertEqual(len(self.docker.actions), actions, message)
+            self.assertEqual(len(self.engine.actions), actions, message)
 
     def test_empty_group_refused_without_force(self):
         self.assertEqual(self.sync_run([cand("alice")]), 0)
@@ -188,7 +207,8 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.sync_run([], force=True), 0)
         self.assertEqual(self.map_users(), [])
-        self.assertIn(("remove", "browser-alice"), self.docker.actions)
+        self.assertIn(("stop", ("browser-alice.service", "rb-net-alice-network.service")), self.engine.actions)
+        self.assertIn(("rm network", "rb-net-alice"), self.engine.actions)
 
     def test_empty_group_on_first_run_refused(self):
         with self.assertRaises(sync.SyncError):
@@ -214,13 +234,10 @@ class SyncTest(unittest.TestCase):
         with self.assertRaisesRegex(sync.SyncError, "state.json"):
             self.sync_run([cand("alice")])
 
-    def test_invalid_compose_is_never_installed(self):
+    def test_rejected_units_are_never_installed(self):
         self.assertEqual(self.sync_run([cand("alice")]), 0)
         before = self.snapshot()
-
-        def reject(files):
-            raise sync.DockerError("services.browser-bob: bad")
-        self.docker.model = reject
+        self.engine.reject = "converting \"browser-bob.container\": unsupported key"
         with self.assertRaisesRegex(sync.SyncError, "rejected"):
             self.sync_run([cand("alice"), cand("bob")])
         self.assertEqual(self.snapshot(), before)
@@ -229,10 +246,10 @@ class SyncTest(unittest.TestCase):
     def test_failed_nginx_test_restores_previous_map(self):
         self.assertEqual(self.sync_run([cand("alice")]), 0)
         old_map = self.settings.map_file.read_text()
-        self.docker.nginx_ok = False
+        self.engine.nginx_ok = False
         self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 1)
         self.assertEqual(self.settings.map_file.read_text(), old_map)
-        self.assertNotIn(("reload",), self.docker.actions[-5:])
+        self.assertNotIn(("reload",), self.engine.actions[-5:])
 
     # --- eligibility -----------------------------------------------------------------------------
 
@@ -296,7 +313,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual([u.uid for u in users], ["d"])
         self.assertEqual(len(errors), 3)
 
-    def test_shared_uid_number_refused_except_demo(self):
+    def test_shared_uid_number_refused_except_file_backend(self):
         users, errors = sync.select_users([cand("a", uid_number=5000), cand("b", uid_number=5000), cand("c")])
         self.assertEqual([u.uid for u in users], ["c"])
         users, _ = sync.select_users([cand("a"), cand("b")], shared_ids_ok=True)
@@ -337,41 +354,93 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.sync_run([cand("alice")], generate_only=True), 0)
         self.assertTrue(self.settings.map_file.exists())
         self.assertFalse((self.tmp / "users" / "alice").exists())
-        self.assertEqual(self.docker.actions, [])
+        self.assertEqual(self.engine.actions, [])
 
     # --- changes, idempotence, apply order ---------------------------------------------------------
 
     def test_add_remove_and_no_change(self):
         self.assertEqual(self.sync_run([cand("alice")]), 0)
         self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 0)
-        self.assertIn(("connect", "rb-unit_net-bob"), self.docker.actions)
-        before, n = self.snapshot(), len(self.docker.actions)
+        self.assertIn(("connect", "rb-net-bob"), self.engine.actions)
+        self.assertTrue((self.tmp / "quadlet" / "browser-bob.container").exists())
+        before, n = self.snapshot(), len(self.engine.actions)
         self.assertEqual(self.sync_run([cand("bob"), cand("alice")]), 0)
         self.assertEqual(self.snapshot(), before)
-        # A no-op run only re-asserts the browsers (compose up is idempotent): no reload, no network change.
-        self.assertEqual(self.docker.actions[n:], [("up", ("browser-alice", "browser-bob"))])
+        # A no-op run only re-asserts the browsers (start is idempotent): no daemon-reload, no restart,
+        # no Nginx reload, no network change.
+        self.assertEqual(self.engine.actions[n:], [("start", ("browser-alice.service", "browser-bob.service"))])
 
-        self.docker.actions.clear()
+        self.engine.actions.clear()
         self.assertEqual(self.sync_run([cand("alice")]), 0)
-        kinds = [a[0] for a in self.docker.actions]
-        self.assertEqual(self.docker.actions[0], ("remove", "browser-bob"))  # streams end first
-        self.assertLess(kinds.index("reload"), kinds.index("up"))
-        self.assertIn(("disconnect", "rb-unit_net-bob"), self.docker.actions)
-        self.assertIn(("rm network", "rb-unit_net-bob"), self.docker.actions)
+        kinds = [a[0] for a in self.engine.actions]
+        # Streams end first, before the unit files go.
+        self.assertEqual(self.engine.actions[0], ("stop", ("browser-bob.service", "rb-net-bob-network.service")))
+        self.assertLess(kinds.index("daemon-reload"), kinds.index("start"))
+        self.assertLess(kinds.index("reload"), kinds.index("start"))
+        self.assertIn(("disconnect", "rb-net-bob"), self.engine.actions)
+        self.assertIn(("rm network", "rb-net-bob"), self.engine.actions)
+        self.assertNotIn("try-restart", kinds)
         self.assertEqual(self.map_users(), ["alice"])
+        self.assertFalse((self.tmp / "quadlet" / "browser-bob.container").exists())
+        self.assertFalse((self.tmp / "quadlet" / "rb-net-bob.network").exists())
+        self.assertTrue((self.tmp / "users" / "bob" / "config").is_dir())  # profile kept
         self.assertTrue((self.settings.map_file.parent / "users.map.prev").exists())
+
+    def test_new_image_restarts_existing_browsers_only(self):
+        self.assertEqual(self.sync_run([cand("alice")]), 0)
+        self.write_env(BROWSER_IMAGE="localhost/remote-dual-browser:new")
+        self.settings = sync.load_settings(self.env)
+        self.engine.s = self.settings
+        self.engine.actions.clear()
+        self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 0)
+        self.assertIn(("try-restart", ("browser-alice.service",)), self.engine.actions)  # not bob: new
+        self.assertIn("Image=localhost/remote-dual-browser:new",
+                      (self.tmp / "quadlet" / "browser-bob.container").read_text())
+
+    def test_unsafe_values_refused(self):
+        for key, value in (("PUBLIC_HOST", "x$(id)"), ("TZ", "Europe/Warsaw %n"), ("BROWSER_IMAGE", 'a"b'),
+                           ("USER_DATA_ROOT", "/srv/my profiles")):
+            self.write_env(**{key: value})
+            with self.assertRaisesRegex(sync.SyncError, key):
+                sync.load_settings(self.env)
+
+    def test_missing_image_refused(self):
+        self.write_env(BROWSER_IMAGE="")
+        self.settings = sync.load_settings(self.env)
+        with self.assertRaisesRegex(sync.SyncError, "BROWSER_IMAGE"):
+            self.sync_run([cand("alice")])
+
+    def test_attach_only_joins_known_networks(self):
+        self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 0)
+        for n in self.engine.nets.values():  # a new Nginx container: on no user network
+            if "rb-nginx" in n["containers"]:
+                n["containers"].remove("rb-nginx")
+        self.engine.actions.clear()
+        self.assertEqual(self.sync_run(None, attach_only=True), 0)
+        self.assertEqual(self.engine.actions[0], ("start", ("rb-net-alice-network.service", "rb-net-bob-network.service")))
+        self.assertEqual(sorted(a for a in self.engine.actions if a[0] == "connect"),
+                         [("connect", "rb-net-alice"), ("connect", "rb-net-bob")])
+        self.engine.actions.clear()
+        self.assertEqual(self.sync_run(None, attach_only=True), 0)  # already attached: nothing
+        self.assertNotIn("connect", [a[0] for a in self.engine.actions])
+
+    def test_nginx_not_running(self):
+        self.engine.nginx = False
+        self.assertEqual(self.sync_run([cand("alice")]), 1)
+        self.assertIn(("start", ("browser-alice.service",)), self.engine.actions)
 
     def test_reload_after_generate_only(self):
         self.assertEqual(self.sync_run([cand("alice")], generate_only=True), 0)
         self.assertEqual(self.sync_run([cand("alice")]), 0)
-        self.assertIn(("reload",), self.docker.actions)
+        self.assertIn(("reload",), self.engine.actions)
 
     def test_output_is_deterministic(self):
         self.assertEqual(self.sync_run([cand("b"), cand("a"), cand("c")]), 0)
         first = self.snapshot()
         shutil.rmtree(self.tmp / "generated")
         shutil.rmtree(self.tmp / "nginx")
-        self.docker = FakeDocker(self.settings)
+        shutil.rmtree(self.tmp / "quadlet")
+        self.engine = FakePodman(self.settings)
         self.assertEqual(self.sync_run([cand("c"), cand("a"), cand("b")]), 0)
         second = self.snapshot()
         for path in first:
@@ -379,28 +448,10 @@ class SyncTest(unittest.TestCase):
                 continue
             self.assertEqual(first[path], second[path], path)
 
-    def test_phase2_leftovers_are_removed(self):
-        self.docker.containers["old"] = "browser-test"
-        self.docker.nets["rb-unit_browser-test"] = {"name": "rb-unit_browser-test", "project": "rb-unit",
-                                                    "key": "browser-test", "subnets": ["10.213.0.16/28"],
-                                                    "containers": ["nginx-id"]}
-        self.assertEqual(self.sync_run([cand("alice")]), 0)
-        self.assertIn(("remove", "browser-test"), self.docker.actions)
-        self.assertIn(("rm network", "rb-unit_browser-test"), self.docker.actions)
-        self.assertNotEqual(self.state()["alice"]["subnet"], "10.213.0.16/28")  # was still in use
-
-    def test_phase2_compose_file_refused(self):
-        self.write_env(COMPOSE_FILE=f"compose.yaml:compose.browser-test.yaml:{self.tmp}/generated/compose.users.yaml")
-        with self.assertRaisesRegex(sync.SyncError, "browser-test"):
-            sync.load_settings(self.env)
-        self.write_env(COMPOSE_FILE="compose.yaml")
-        with self.assertRaisesRegex(sync.SyncError, "must include"):
-            sync.load_settings(self.env)
-
     # --- subnets ---------------------------------------------------------------------------------
 
     def test_subnets_stable_and_skip_used(self):
-        self.docker = FakeDocker(self.settings, other_subnets=["10.213.0.0/24"])
+        self.engine = FakePodman(self.settings, other_subnets=["10.213.0.0/24"])
         self.assertEqual(self.sync_run([cand("bob")]), 0)
         self.assertEqual(self.state()["bob"]["subnet"], "10.213.1.0/28")
         self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 0)
@@ -417,42 +468,57 @@ class SyncTest(unittest.TestCase):
 
     # --- generated files -------------------------------------------------------------------------
 
-    def test_generated_yaml_and_map(self):
-        import yaml
+    def test_generated_units_and_map(self):
         self.assertEqual(self.sync_run([cand("alice"), cand("bob-2")]), 0)
-        data = yaml.safe_load(self.settings.compose_out.read_text())
-        self.assertEqual(sorted(data["services"]), ["browser-alice", "browser-bob-2"])
-        svc = data["services"]["browser-alice"]
-        self.assertEqual(svc["hostname"], "browser-alice")
-        self.assertEqual(svc["networks"], ["net-alice"])
-        self.assertEqual(svc["environment"]["PUID"], str(ME))
-        self.assertEqual(svc["expose"], ["3000"])
-        self.assertNotIn("ports", svc)
-        self.assertNotIn("privileged", svc)
-        self.assertNotIn("docker.sock", self.settings.compose_out.read_text())
-        self.assertEqual(svc["security_opt"], ["seccomp=./browser-image/seccomp-chrome.json", "no-new-privileges:true"])
-        self.assertEqual(svc["cap_drop"], ["ALL"])
-        self.assertIn("SYS_CHROOT", svc["cap_add"])  # both browser sandboxes chroot
-        self.assertFalse({"SYS_ADMIN", "NET_RAW", "MKNOD", "NET_ADMIN"} & set(svc["cap_add"]))
-        self.assertGreater(svc["pids_limit"], 0)
+        qdir = self.tmp / "quadlet"
+        self.assertEqual(sorted(p.name for p in qdir.iterdir()),
+                         ["browser-alice.container", "browser-bob-2.container",
+                          "rb-net-alice.network", "rb-net-bob-2.network"])
+        unit = parse_unit((qdir / "browser-alice.container").read_text())
+        c = unit["Container"]
+        self.assertEqual(c["ContainerName"], ["browser-alice"])
+        self.assertEqual(c["HostName"], ["browser-alice"])
+        self.assertEqual(c["Network"], ["rb-net-alice.network"])
+        self.assertIn(f"PUID={ME}", c["Environment"])
+        self.assertIn("SELKIES_ALLOWED_ORIGINS=https://browser.example.com,https://browser.example.com:443",
+                      c["Environment"])
+        self.assertEqual(c["Volume"], [f"{self.tmp}/users/alice/config:/config:Z"])
+        self.assertNotIn("PublishPort", c)
+        self.assertNotIn("PodmanArgs", c)
+        self.assertNotIn("SeccompProfile", c)  # Podman's default
+        self.assertEqual(c["NoNewPrivileges"], ["true"])
+        self.assertEqual(c["DropCapability"], ["ALL"])
+        caps = c["AddCapability"][0].split()
+        self.assertIn("SYS_CHROOT", caps)  # both browser sandboxes chroot
+        self.assertFalse({"SYS_ADMIN", "NET_RAW", "MKNOD", "NET_ADMIN"} & set(caps))
+        self.assertGreater(int(c["PidsLimit"][0]), 0)
+        self.assertEqual(unit["Unit"]["Requires"], ["remote-browser-egress.service"])
+        net = parse_unit((qdir / "rb-net-bob-2.network").read_text())["Network"]
+        self.assertEqual(net["NetworkName"], ["rb-net-bob-2"])
+        self.assertEqual(net["Subnet"], ["10.213.0.16/28"])
         self.assertEqual(self.map_users(), ["alice", "bob-2"])
 
-    @unittest.skipUnless(shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0,
-                         "docker not available")
-    def test_generated_compose_accepted_by_docker_compose(self):
-        self.docker = sync.Docker(self.settings)
-        self.docker.networks = lambda: []  # do not depend on this host's networks
-        self.assertEqual(sync.run(self.settings, args(generate_only=True), docker=self.docker,
-                                  candidates=[cand("alice"), cand("bob")]), 0)
-        model = self.docker.model(self.settings.compose_files)
-        self.assertEqual(model["services"]["browser-alice"]["volumes"][0]["source"],
-                         str(self.tmp / "users" / "alice" / "config"))
-        self.assertEqual(set(model["services"]["nginx"]["networks"]), {"frontend"})
-        self.assertEqual(model["networks"]["net-bob"]["ipam"]["config"][0]["subnet"], "10.213.0.16/28")
-        # Empty result (--force) still renders a valid file.
-        self.assertEqual(sync.run(self.settings, args(generate_only=True, force=True), docker=self.docker,
-                                  candidates=[]), 0)
-        self.docker.model(self.settings.compose_files)
+    def test_foreign_files_in_quadlet_dir_left_alone(self):
+        qdir = self.tmp / "quadlet"
+        qdir.mkdir()
+        for name in ("rb-nginx.container", "rb-frontend.network", "browser-Bad.container", "notes.txt"):
+            (qdir / name).write_text("keep")
+        self.assertEqual(self.sync_run([cand("alice")]), 0)
+        self.assertEqual(self.sync_run([cand("bob")]), 0)
+        for name in ("rb-nginx.container", "rb-frontend.network", "browser-Bad.container", "notes.txt"):
+            self.assertEqual((qdir / name).read_text(), "keep")
+
+    @unittest.skipUnless(sync.rb_units.generator(), "Podman's Quadlet generator not installed")
+    def test_generated_units_accepted_by_quadlet(self):
+        self.assertEqual(self.sync_run([cand("alice"), cand("bob")]), 0)
+        units = sync.generated_unit_files(self.tmp / "quadlet")
+        out = sync.rb_units.validate(units)
+        self.assertIn("---browser-alice.service---", out)
+        self.assertIn("Requires=rb-net-alice-network.service", out)
+        self.assertIn("--cap-drop all", out)
+        self.assertIn(f"-v {self.tmp}/users/alice/config:/config:Z", out)
+        with self.assertRaises(sync.UnitError):
+            sync.rb_units.validate({"browser-x.container": units["browser-alice.container"] + "Bogus=1\n"})
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@
 #   OTHER_USER / OTHER_PASS               a second user with a browser (optional): each user reaches only
 #                                         their own container
 #   UNPROVISIONED_USER / UNPROVISIONED_PASS   group member WITHOUT a browser (optional, skipped if unset)
-#   PROJECT                               Compose project; when set (and docker works here), the Nginx
-#                                         access log proves which container served each user
+#   ACCESS_LOG=1                          on the browser VM as root: the Nginx access log (podman logs
+#                                         rb-nginx) proves which container served each user
 #   PUBLIC_HOST, AUTHELIA_HOST, PUBLIC_PORT, TARGET_IP, CACERT, INSECURE   as for tests/phase1-auth.sh
 #   BACKEND_ADDR                          ip:port of the browser VM's Nginx (HTTPS_PORT), optional:
 #                                         a connection that bypasses the reverse proxy must get no answer
@@ -55,17 +55,15 @@ ws_handshake() {
 
 # Did the last request of user $1 reach the container browser-$1? (Nginx logs upstream=<ip:port>.)
 served_by_own_browser() {
-    local user="$1" nginx browser ips addr
-    nginx="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter label=com.docker.compose.service=nginx)"
-    browser="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=browser-$user")"
-    [[ -n "$nginx" && -n "$browser" ]] || return 1
-    ips=" $(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$browser")"
-    addr="$(docker logs --since 2m "$nginx" 2>/dev/null | grep -F " - $user [" | grep -o 'upstream=[0-9.:]*' | tail -n1)"
+    local user="$1" ips addr
+    ips=" $(podman container inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "browser-$user" 2>/dev/null)"
+    [[ "$ips" != " " ]] || return 1
+    addr="$(podman logs --since 2m rb-nginx 2>/dev/null | grep -F " - $user [" | grep -o 'upstream=[0-9.:]*' | tail -n1)"
     addr="${addr#upstream=}"
     [[ -n "$addr" && "$ips" == *" ${addr%:*} "* ]]
 }
 route_check() {
-    [[ -n "${PROJECT:-}" ]] || return 0
+    [[ "${ACCESS_LOG:-0}" == 1 ]] || return 0
     if served_by_own_browser "$1"; then ok "Nginx routed $1 to browser-$1"
     else bad "Nginx routed $1 to browser-$1" "upstream in the access log is not that container"; fi
 }

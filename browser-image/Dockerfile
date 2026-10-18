@@ -60,7 +60,7 @@ RUN set -eux; \
 
 # Selkies data paths into the session, off unless needed (plan §43). The clipboard stays on;
 # microphone forwarding is off by Selkies default. SELKIES_ALLOWED_ORIGINS (the base image sets "*")
-# is set per container to the public origin, see compose.browser-test.yaml.
+# is set per container to the public origin, see scripts/rb_units.py.
 ENV SELKIES_WEBCAM_ENABLED=false \
     SELKIES_UI_SIDEBAR_SHOW_WEBCAM=false \
     SELKIES_GAMEPAD_ENABLED=false

@@ -1,16 +1,13 @@
 # Egress filter for the browser containers (scripts/egress-firewall.sh, plan §30a): an nftables table
-# of its own, for Docker and Podman alike. Applied at boot before any container starts. Install
-# (replace the path with your root-owned checkout):
-#   sed 's|@REPO_DIR@|/opt/remote-browser|' systemd/remote-browser-egress.service \
-#       | sudo tee /etc/systemd/system/remote-browser-egress.service
-#   sudo systemctl daemon-reload && sudo systemctl enable --now remote-browser-egress.service
+# of its own. Applied at boot before Nginx and any browser starts; every browser unit Requires= it,
+# so no browser runs without it. Installed by scripts/install-units.py.
 #
-# Restarting a service that flushes the whole ruleset (Debian's nftables.service) removes the table:
+# Restarting a service that flushes the whole ruleset (nftables.service) removes the table:
 # restart this unit afterwards. PartOf makes that automatic for nftables.service.
 [Unit]
 Description=Remote browser: block browser containers from LAN, host and each other
 After=nftables.service firewalld.service network-pre.target
-Before=docker.service podman.service podman-restart.service
+Before=rb-nginx.service
 PartOf=nftables.service
 
 [Service]

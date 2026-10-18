@@ -2,41 +2,46 @@
 """Provision one browser container per eligible FreeIPA user (plan §14-17, §32-35).
 
 Reads the direct members of FREEIPA_BROWSER_GROUP that pass Authelia's FreeIPA account filter
-(freeipa_common.py) and makes the Docker host match:
+(freeipa_common.py) and makes the Podman host match (scripts/rb_units.py):
 
-  GENERATED_DIR/compose.users.yaml   service browser-<uid> + network net-<uid> per user
-  GENERATED_DIR/state.json           uidNumber/gidNumber/subnet per user (subnets stay put)
-  NGINX_GENERATED_DIR/users.map      "<uid>" "browser-<uid>:3000"; whitelist for Nginx
-  USER_DATA_ROOT/<uid>/config        created owned by uidNumber:gidNumber, mode 0700; never deleted
+  QUADLET_DIR/browser-<uid>.container  the user's browser (browser-<uid>.service)
+  QUADLET_DIR/rb-net-<uid>.network     the user's own network, a /28 of BROWSER_NET_POOL
+  GENERATED_DIR/state.json             uidNumber/gidNumber/subnet per user (subnets stay put)
+  NGINX_GENERATED_DIR/users.map        "<uid>" "browser-<uid>:3000"; whitelist for Nginx
+  USER_DATA_ROOT/<uid>/config          created owned by uidNumber:gidNumber, mode 0700; never deleted
 
 then, unless --generate-only / --dry-run:
-  1. stops and removes browser containers of users who are no longer eligible (ends their streams);
-  2. reloads Nginx after `nginx -t` (the previous map is restored if the test fails);
-  3. `docker compose up -d` for every user's browser (starts new ones, applies BROWSER_IMAGE changes);
-  4. attaches Nginx to every user network, live: putting the networks into Nginx's Compose definition
-     would make Compose recreate Nginx, and drop every open stream, whenever a user is added;
-  5. detaches Nginx from and removes networks no longer in the project.
+  1. stops the browsers of users who are no longer eligible (ends their streams), removes their units;
+  2. installs the new units, `systemctl daemon-reload`;
+  3. reloads Nginx after `nginx -t` (the previous map is restored if the test fails);
+  4. restarts browsers whose unit changed (e.g. BROWSER_IMAGE), starts every user's browser;
+  5. attaches Nginx to every user network, live: listing the networks in rb-nginx.container would
+     restart Nginx, and drop every open stream, whenever a user is added;
+  6. detaches Nginx from and removes user networks of users who lost access.
+
+--attach-only (rb-nginx.service's ExecStartPost): only step 5, for the users in state.json. A new Nginx
+container is on no user network.
 
 Fail-safe (plan §32): any LDAP or configuration error aborts before anything changes; an empty group or
-more than SYNC_MAX_REMOVALS (default 2) removals is refused without --force; generated files are written
-atomically after `docker compose config` accepted them, previous versions kept as *.prev; runs never
-overlap (flock). Running it again without FreeIPA changes changes nothing.
+more than SYNC_MAX_REMOVALS (default 2) removals is refused without --force; units are installed only
+after Podman's Quadlet generator accepted them, the other generated files atomically with the previous
+versions kept as *.prev; runs never overlap (flock). Running it again without FreeIPA changes changes
+nothing.
 
 Users whose uid is not a safe name (^[a-z][a-z0-9-]{0,30}$), whose uidNumber/gidNumber is missing or 0,
 or whose profile directory is owned by someone else are not provisioned and are reported; the others
 still are (exit status 2).
 
-Run as root (it chowns profile directories to the users' uidNumbers) from a root-owned checkout, after
-the stack is up. After `docker compose up -d` recreated Nginx, run it again: a recreated Nginx is on no
-user network until then.
+Run as root (it chowns profile directories to the users' uidNumbers and drives rootful Podman and
+systemd) from a root-owned checkout.
 
 Usage:
-  sync-freeipa-users.py [--env-file FILE] [--dry-run | --generate-only] [--force]
+  sync-freeipa-users.py [--env-file FILE] [--dry-run | --generate-only | --attach-only] [--force]
 
 Exit status: 0 ok, 1 aborted (nothing changed) or apply error, 2 applied but some users skipped.
 
-AUTH_BACKEND=file (the local demo): users come from Authelia's users file (AUTHELIA_USERS_FILE), all
-with DEMO_UID/DEMO_GID, eligible when in the group and not disabled, as the demo Authelia decides.
+AUTH_BACKEND=file (unit tests only): users come from an Authelia-style users file (AUTHELIA_USERS_FILE),
+all with DEMO_UID/DEMO_GID, eligible when in the group and not disabled.
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rb_units  # noqa: E402
 from freeipa_common import (  # noqa: E402
     REPO_DIR,
     UID_RE,
@@ -64,21 +70,16 @@ from freeipa_common import (  # noqa: E402
     read_env_file,
     resolve_members,
 )
+from rb_units import BROWSER_PREFIX, NETWORK_PREFIX, NGINX, USER_LABEL, BrowserConfig, UnitError  # noqa: E402
 
 SUBNET_PREFIX = 28  # nginx + one browser per network
 STATE_VERSION = 1
-BROWSER_PREFIX = "browser-"
-NETWORK_PREFIX = "net-"
-# Compose's own separator for COMPOSE_FILE on Linux.
-COMPOSE_PATH_SEPARATOR = ":"
-PHASE2_FILE = "compose.browser-test.yaml"
-PHASE2_NETWORK = "browser-test"
 
-# Keys read from the env file; the process environment overrides them, as with docker compose.
+# Keys read from the env file; the process environment overrides them.
 SETTING_KEYS = (
-    "AUTH_BACKEND", "FREEIPA_BROWSER_GROUP", "COMPOSE_PROJECT_NAME", "COMPOSE_FILE", "GENERATED_DIR",
-    "NGINX_GENERATED_DIR", "USER_DATA_ROOT", "BROWSER_NET_POOL", "SYNC_MAX_REMOVALS",
-    "AUTHELIA_USERS_FILE", "DEMO_UID", "DEMO_GID", "CONTAINER_ENGINE",
+    "AUTH_BACKEND", "FREEIPA_BROWSER_GROUP", "QUADLET_DIR", "GENERATED_DIR", "NGINX_GENERATED_DIR",
+    "USER_DATA_ROOT", "BROWSER_NET_POOL", "SYNC_MAX_REMOVALS", "AUTHELIA_USERS_FILE", "DEMO_UID", "DEMO_GID",
+    "BROWSER_IMAGE", "TZ", "PUBLIC_HOST", "PUBLIC_PORT", "BROWSER_FILE_TRANSFERS",
 )
 
 
@@ -97,7 +98,7 @@ def warn(msg: str) -> None:
 # --- settings ---------------------------------------------------------------------------------
 
 def repo_path(value: str) -> Path:
-    """Relative paths are relative to the repository, as for Compose bind mounts."""
+    """Relative paths in .env are relative to the repository."""
     path = Path(value)
     return path if path.is_absolute() else REPO_DIR / path
 
@@ -106,10 +107,8 @@ def repo_path(value: str) -> Path:
 class Settings:
     env_file: Path
     backend: str
-    engine: str
     group: str
-    project: str
-    compose_files: tuple[Path, ...]
+    quadlet_dir: Path
     generated_dir: Path
     nginx_generated_dir: Path
     user_data_root: Path
@@ -117,10 +116,8 @@ class Settings:
     max_removals: int
     users_file: Path | None
     demo_ids: tuple[int, int] | None
-
-    @property
-    def compose_out(self) -> Path:
-        return self.generated_dir / "compose.users.yaml"
+    # Rendered into every browser unit; empty image only for --dry-run / --attach-only.
+    browser: BrowserConfig
 
     @property
     def state_file(self) -> Path:
@@ -150,28 +147,12 @@ def load_settings(env_file: Path) -> Settings:
     if backend not in ("freeipa", "file"):
         raise SyncError(f"AUTH_BACKEND must be freeipa or file, not {backend!r}")
 
-    generated_dir = repo_path(get("GENERATED_DIR", "./generated"))
-    compose_out = generated_dir / "compose.users.yaml"
-    files_value = get("COMPOSE_FILE", f"compose.yaml{COMPOSE_PATH_SEPARATOR}{compose_out}")
-    files = tuple(repo_path(f) for f in files_value.split(COMPOSE_PATH_SEPARATOR) if f)
-    resolved = [f.resolve() for f in files]
-    if compose_out.resolve() not in resolved:
-        raise SyncError(f"COMPOSE_FILE ({files_value}) must include {compose_out}, or docker compose would "
-                        "not see the generated browser services")
-    if any(f.name == PHASE2_FILE for f in files):
-        raise SyncError(f"COMPOSE_FILE still includes {PHASE2_FILE} (Phase 2). Replace it with {compose_out} "
-                        "(README, 'Provisioning'); the sync then removes the test container.")
-
     try:
         pool = ipaddress.ip_network(get("BROWSER_NET_POOL", "10.213.0.0/16"))
     except ValueError as exc:
         raise SyncError(f"invalid BROWSER_NET_POOL: {exc}") from exc
     if pool.version != 4 or pool.prefixlen > SUBNET_PREFIX:
         raise SyncError(f"BROWSER_NET_POOL must be an IPv4 network of /{SUBNET_PREFIX} or larger")
-
-    engine = get("CONTAINER_ENGINE", "docker")
-    if engine not in ("docker", "podman"):
-        raise SyncError(f"CONTAINER_ENGINE must be docker or podman, not {engine!r}")
 
     try:
         max_removals = int(get("SYNC_MAX_REMOVALS", "2"))
@@ -180,26 +161,38 @@ def load_settings(env_file: Path) -> Settings:
 
     users_file = demo_ids = None
     if backend == "file":
-        users_file = repo_path(get("AUTHELIA_USERS_FILE", "./demo/users.yml"))
+        users_file = repo_path(get("AUTHELIA_USERS_FILE", "./users.yml"))
         try:
             demo_ids = (int(get("DEMO_UID")), int(get("DEMO_GID")))
         except ValueError as exc:
-            raise SyncError("AUTH_BACKEND=file needs DEMO_UID and DEMO_GID (scripts/demo.sh sets them)") from exc
+            raise SyncError("AUTH_BACKEND=file needs DEMO_UID and DEMO_GID") from exc
+
+    user_data_root = repo_path(get("USER_DATA_ROOT", "./local/users"))
+    try:
+        browser = BrowserConfig(
+            image=rb_units.safe("BROWSER_IMAGE", get("BROWSER_IMAGE")),
+            tz=rb_units.safe("TZ", get("TZ", "UTC")),
+            public_host=rb_units.safe("PUBLIC_HOST", get("PUBLIC_HOST")),
+            public_port=rb_units.safe("PUBLIC_PORT", get("PUBLIC_PORT", "443")),
+            file_transfers=rb_units.safe("BROWSER_FILE_TRANSFERS", get("BROWSER_FILE_TRANSFERS")),
+            user_data_root=Path(rb_units.safe("USER_DATA_ROOT", str(user_data_root))),
+        )
+    except UnitError as exc:
+        raise SyncError(str(exc)) from exc
 
     return Settings(
         env_file=env_file,
         backend=backend,
-        engine=engine,
         group=get("FREEIPA_BROWSER_GROUP", "remote-browser-users"),
-        project=get("COMPOSE_PROJECT_NAME", "remote-browser"),
-        compose_files=files,
-        generated_dir=generated_dir,
+        quadlet_dir=Path(get("QUADLET_DIR", rb_units.QUADLET_DIR)),
+        generated_dir=repo_path(get("GENERATED_DIR", "./generated")),
         nginx_generated_dir=repo_path(get("NGINX_GENERATED_DIR", "./nginx/generated")),
-        user_data_root=repo_path(get("USER_DATA_ROOT", "./local/users")),
+        user_data_root=user_data_root,
         pool=pool,
         max_removals=max_removals,
         users_file=users_file,
         demo_ids=demo_ids,
+        browser=browser,
     )
 
 
@@ -245,7 +238,7 @@ def ldap_candidates(settings: Settings) -> list[Candidate]:
 
 
 def file_candidates(settings: Settings) -> list[Candidate]:
-    """Demo: Authelia file backend users in the group and not disabled."""
+    """Tests: Authelia file backend users in the group and not disabled."""
     try:
         import yaml
     except ImportError as exc:
@@ -273,7 +266,7 @@ def file_candidates(settings: Settings) -> list[Candidate]:
 def select_users(candidates: list[Candidate], shared_ids_ok: bool = False) -> tuple[list[User], list[str]]:
     """Validate names and numbers; refuse ambiguity instead of guessing. Returns (users, errors).
 
-    shared_ids_ok: the demo runs every browser with the same uid on purpose."""
+    shared_ids_ok: the file backend (tests) runs every browser with the same uid on purpose."""
     errors: list[str] = []
     by_source: dict[str, Candidate] = {}
     for c in candidates:
@@ -358,7 +351,7 @@ def allocate_subnets(users: list[User], previous: dict[str, str], pool: ipaddres
                      in_use: list[ipaddress.IPv4Network]) -> dict[str, str]:
     """Keep each user's subnet; give new users the lowest free /28 of the pool.
 
-    in_use: subnets of Docker networks other than these users' own networks."""
+    in_use: subnets of Podman networks other than these users' own networks."""
     def free(net: ipaddress.IPv4Network, taken: list[ipaddress.IPv4Network]) -> bool:
         return not any(net.overlaps(t) for t in taken)
 
@@ -386,97 +379,31 @@ def allocate_subnets(users: list[User], previous: dict[str, str], pool: ipaddres
 
 # --- rendering --------------------------------------------------------------------------------
 
-# Container restrictions of every browser (plan §31, §66), tested against both browser sandboxes by
-# tests/phase2-browser.sh. The sandboxes use unprivileged user namespaces (allowed by the seccomp
-# profile), not the setuid chrome-sandbox helper, so no-new-privileges costs nothing. The capabilities
-# are what the image's init needs as root before it drops to the session user, plus SYS_CHROOT.
-# Dropped from Docker's default set: MKNOD, NET_RAW, NET_BIND_SERVICE, FSETID, SETFCAP, SETPCAP,
-# AUDIT_WRITE.
-SECCOMP = [
-    "      # Docker's default profile plus clone/unshare for the browser sandboxes.",
-    "      - seccomp=./browser-image/seccomp-chrome.json",
-]
-# Podman: Compose sends a custom profile's contents, which Podman's API takes for a file name, so no
-# profile is given and Podman's default applies. Unlike Docker's, it allows the unprivileged user
-# namespaces the sandboxes use (tests/phase2-browser.sh checks both sandboxes).
-SECCOMP_PODMAN = [
-    "      # seccomp: Podman's default profile (it allows the browser sandboxes' user namespaces).",
-]
-HARDENING = [
-    "    cap_drop:",
-    "      - ALL",
-    "    cap_add:",
-    "      - CHOWN",
-    "      - DAC_OVERRIDE",
-    "      - FOWNER",
-    "      - SETGID",
-    "      - SETUID",
-    "      - KILL",
-    "      # Both sandboxes chroot their child processes, and the seccomp profile allows chroot(2) only",
-    "      # with this capability.",
-    "      - SYS_CHROOT",
-    "    # Generous for two browsers; stops a fork bomb from taking the VM down.",
-    "    pids_limit: 4096",
-    "    healthcheck:",
-    '      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/"]',
-    "      interval: 1m",
-    "      timeout: 10s",
-    "      start_period: 2m",
-    "    logging:",
-    "      driver: json-file",
-    "      options:",
-    '        max-size: "10m"',
-    '        max-file: "3"',
-]
+def render_units(settings: Settings, users: list[User], subnets: dict[str, str]) -> dict[str, str]:
+    """Every generated unit file in QUADLET_DIR, by file name."""
+    units = {}
+    for u in users:
+        units[f"{NETWORK_PREFIX}{u.uid}.network"] = rb_units.user_network(u.uid, subnets[u.uid])
+        units[f"{BROWSER_PREFIX}{u.uid}.container"] = rb_units.browser_container(
+            u.uid, u.uid_number, u.gid_number, settings.browser)
+    return units
 
 
-def render_compose(users: list[User], subnets: dict[str, str], group: str, engine: str = "docker") -> str:
-    """Values are validated (uid regex, integers, subnets), so plain formatting is safe."""
-    out = [
-        f"# Generated by scripts/sync-freeipa-users.py from the FreeIPA group {group}. Do not edit:",
-        "# the next sync overwrites it. Nginx is attached to the networks by the sync, not here.",
-    ]
-    if not users:
-        out += ["services: {}", ""]
-        return "\n".join(out)
-    out.append("services:")
-    for u in users:
-        out += [
-            f"  {BROWSER_PREFIX}{u.uid}:",
-            "    image: ${BROWSER_IMAGE:?set BROWSER_IMAGE in .env}",
-            "    # Stable hostname: Chrome and Firefox profile locks embed it (plan §24).",
-            f"    hostname: {BROWSER_PREFIX}{u.uid}",
-            "    restart: unless-stopped",
-            "    environment:",
-            f'      PUID: "{u.uid_number}"',
-            f'      PGID: "{u.gid_number}"',
-            "      TZ: ${TZ:-UTC}",
-            f"      REMOTE_BROWSER_USER: {u.uid}",
-            "      SELKIES_FILE_TRANSFERS: ${BROWSER_FILE_TRANSFERS:-}",
-            "      SELKIES_ALLOWED_ORIGINS: https://${PUBLIC_HOST},https://${PUBLIC_HOST}:${PUBLIC_PORT:-443}",
-            "    volumes:",
-            f"      - ${{USER_DATA_ROOT:-./local/users}}/{u.uid}/config:/config",
-            "    expose:",
-            '      - "3000"',
-            "    shm_size: 1gb",
-            "    networks:",
-            f"      - {NETWORK_PREFIX}{u.uid}",
-            "    security_opt:",
-            *(SECCOMP_PODMAN if engine == "podman" else SECCOMP),
-            "      - no-new-privileges:true",
-            *HARDENING,
-        ]
-    out.append("networks:")
-    for u in users:
-        out += [
-            f"  {NETWORK_PREFIX}{u.uid}:",
-            "    enable_ipv6: false",
-            "    ipam:",
-            "      config:",
-            f"        - subnet: {subnets[u.uid]}",
-        ]
-    out.append("")
-    return "\n".join(out)
+def generated_unit_files(quadlet_dir: Path) -> dict[str, str]:
+    """The sync's own files in QUADLET_DIR (rb-frontend.network and rb-nginx.container are not)."""
+    if not quadlet_dir.is_dir():
+        return {}
+    result = {}
+    for pattern in (f"{BROWSER_PREFIX}*.container", f"{NETWORK_PREFIX}*.network"):
+        for p in quadlet_dir.glob(pattern):
+            uid = p.name.removeprefix(BROWSER_PREFIX).removeprefix(NETWORK_PREFIX).rsplit(".", 1)[0]
+            if UID_RE.fullmatch(uid):
+                result[p.name] = p.read_text()
+    return result
+
+
+def unit_uid(name: str) -> str:
+    return name.removeprefix(BROWSER_PREFIX).removeprefix(NETWORK_PREFIX).rsplit(".", 1)[0]
 
 
 def render_map(users: list[User], group: str) -> str:
@@ -541,89 +468,78 @@ def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
         raise
 
 
-# --- docker -----------------------------------------------------------------------------------
+# --- podman and systemd ------------------------------------------------------------------------
 
-class DockerError(Exception):
+class EngineError(Exception):
     pass
 
 
-class Docker:
-    """The few Docker operations the sync needs. Replaced by a fake in tests/test_sync.py."""
+class Podman:
+    """The few Podman and systemd operations the sync needs. Replaced by a fake in tests/test_sync.py."""
 
     def __init__(self, settings: Settings):
         self.s = settings
 
     def _run(self, *args: str, check: bool = True) -> str:
-        # cwd: Compose resolves the seccomp profile path against the working directory.
-        proc = subprocess.run(args, capture_output=True, text=True, cwd=REPO_DIR)
+        proc = subprocess.run(args, capture_output=True, text=True)
         if check and proc.returncode != 0:
-            raise DockerError(f"{' '.join(args[:4])} ...: {(proc.stderr or proc.stdout).strip()}")
+            raise EngineError(f"{' '.join(args[:4])} ...: {(proc.stderr or proc.stdout).strip()}")
         return proc.stdout
 
-    def _compose(self, files: tuple[Path, ...], *args: str) -> str:
-        cmd = ["docker", "compose", "--project-directory", str(REPO_DIR), "--env-file", str(self.s.env_file),
-               "-p", self.s.project]
-        for f in files:
-            cmd += ["-f", str(f)]
-        return self._run(*cmd, *args)
-
-    def model(self, files: tuple[Path, ...]) -> dict:
-        """`docker compose config` of these files: validates them and returns the project model."""
-        return json.loads(self._compose(files, "config", "--format", "json"))
+    def validate(self, units: dict[str, str]) -> None:
+        """Podman's Quadlet generator over the new units; raises EngineError if it rejects them."""
+        try:
+            rb_units.validate(units)
+        except UnitError as exc:
+            raise EngineError(str(exc)) from exc
 
     def networks(self) -> list[dict]:
-        """All Docker networks: name, compose project/network labels, IPv4 subnets."""
-        ids = self._run("docker", "network", "ls", "-q").split()
-        if not ids:
+        """All Podman networks: name, remote-browser user label, IPv4 subnets, container names."""
+        names = self._run("podman", "network", "ls", "--format", "{{.Name}}").split()
+        if not names:
             return []
         result = []
-        for n in json.loads(self._run("docker", "network", "inspect", *ids)):
-            labels = n.get("Labels") or {}
+        for n in json.loads(self._run("podman", "network", "inspect", *names)):
             result.append({
-                "name": n["Name"],
-                "project": labels.get("com.docker.compose.project"),
-                "key": labels.get("com.docker.compose.network"),
-                "subnets": [c["Subnet"] for c in (n.get("IPAM") or {}).get("Config") or [] if "Subnet" in c],
-                "containers": sorted((n.get("Containers") or {}).keys()),
+                "name": n["name"],
+                "user": (n.get("labels") or {}).get(USER_LABEL),
+                "subnets": [s["subnet"] for s in n.get("subnets") or []],
+                "containers": sorted(c.get("name", "") for c in (n.get("containers") or {}).values()),
             })
         return result
 
-    def project_containers(self) -> list[tuple[str, str]]:
-        """(id, service) of every container of the project, running or not."""
-        out = self._run("docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={self.s.project}",
-                        "--format", '{{.ID}}\t{{.Label "com.docker.compose.service"}}')
-        return [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
+    def nginx_running(self) -> bool:
+        out = self._run("podman", "container", "inspect", "--format", "{{.State.Running}}", NGINX, check=False)
+        return out.strip() == "true"
 
-    def running_nginx(self) -> str | None:
-        out = self._run("docker", "ps", "-q", "--no-trunc",
-                        "--filter", f"label=com.docker.compose.project={self.s.project}",
-                        "--filter", "label=com.docker.compose.service=nginx")
-        ids = out.split()
-        return ids[0] if len(ids) == 1 else None
-
-    def remove_container(self, cid: str) -> None:
-        self._run("docker", "stop", "-t", "10", cid)
-        self._run("docker", "rm", cid)
-
-    def nginx_test(self, cid: str) -> tuple[bool, str]:
-        proc = subprocess.run(["docker", "exec", cid, "nginx", "-t"], capture_output=True, text=True)
+    def nginx_test(self) -> tuple[bool, str]:
+        proc = subprocess.run(["podman", "exec", NGINX, "nginx", "-t"], capture_output=True, text=True)
         return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
-    def nginx_reload(self, cid: str) -> None:
-        self._run("docker", "exec", cid, "nginx", "-s", "reload")
+    def nginx_reload(self) -> None:
+        self._run("podman", "exec", NGINX, "nginx", "-s", "reload")
 
-    def up(self, services: list[str]) -> None:
-        self._compose(self.s.compose_files, "up", "-d", "--no-deps", "--quiet-pull", *services)
+    def daemon_reload(self) -> None:
+        self._run("systemctl", "daemon-reload")
 
-    def connect(self, network: str, cid: str) -> None:
-        self._run("docker", "network", "connect", network, cid)
+    def stop(self, units: list[str]) -> None:
+        self._run("systemctl", "stop", *units)
 
-    def disconnect(self, network: str, cid: str) -> None:
-        self._run("docker", "network", "disconnect", network, cid)
+    def try_restart(self, units: list[str]) -> None:
+        self._run("systemctl", "try-restart", *units)
+
+    def start(self, units: list[str]) -> None:
+        self._run("systemctl", "start", *units)
+
+    def connect(self, network: str) -> None:
+        self._run("podman", "network", "connect", network, NGINX)
+
+    def disconnect(self, network: str) -> None:
+        self._run("podman", "network", "disconnect", network, NGINX)
 
     def remove_network(self, network: str) -> None:
-        self._run("docker", "network", "rm", network)
-
+        # Never -f: that would remove the containers on it, i.e. Nginx.
+        self._run("podman", "network", "rm", network)
 
 # --- the sync ---------------------------------------------------------------------------------
 
@@ -633,11 +549,14 @@ class Plan:
     errors: list[str]
     added: list[str]
     removed: list[str]
-    files: dict[Path, str]  # path -> new content
+    files: dict[Path, str]  # map and state: path -> new content
     changed: list[Path]
+    units: dict[str, str]  # every generated unit: file name -> content
+    units_changed: list[str]  # new or different
+    units_stale: list[str]  # installed, no longer wanted
 
 
-def make_plan(settings: Settings, candidates: list[Candidate], docker: Docker, force: bool) -> Plan:
+def make_plan(settings: Settings, candidates: list[Candidate], engine: Podman, force: bool) -> Plan:
     """Decide everything without changing anything."""
     users, errors = select_users(candidates, shared_ids_ok=settings.backend == "file")
 
@@ -662,63 +581,71 @@ def make_plan(settings: Settings, candidates: list[Candidate], docker: Docker, f
     if len(removed) > settings.max_removals and not force:
         raise SyncError(f"would remove {len(removed)} users ({', '.join(removed)}), more than "
                         f"SYNC_MAX_REMOVALS={settings.max_removals}; refusing without --force")
+    if users and not settings.browser.image:
+        raise SyncError("BROWSER_IMAGE is not set (scripts/build-browser-image.sh prints the tag)")
+    if users and not settings.browser.public_host:
+        raise SyncError("PUBLIC_HOST is not set")
 
-    own = {f"{NETWORK_PREFIX}{u.uid}" for u in users}
+    own = {rb_units.network_name(u.uid) for u in users}
     in_use = []
-    for n in docker.networks():
-        if n["project"] == settings.project and n["key"] in own:
+    for n in engine.networks():
+        if n["name"] in own:
             continue
         in_use += [ipaddress.ip_network(s) for s in n["subnets"] if ipaddress.ip_network(s).version == 4]
     subnets = allocate_subnets(users, {uid: v.get("subnet") for uid, v in previous.items()}, settings.pool,
                                in_use)
 
     files = {
-        settings.compose_out: render_compose(users, subnets, settings.group, settings.engine),
         settings.map_file: render_map(users, settings.group),
         settings.state_file: render_state(users, subnets),
     }
     changed = [p for p, content in files.items() if read_text(p) != content]
-    return Plan(users, errors, added, removed, files, changed)
+    units = render_units(settings, users, subnets)
+    installed = generated_unit_files(settings.quadlet_dir)
+    units_changed = sorted(n for n, c in units.items() if installed.get(n) != c)
+    units_stale = sorted(installed.keys() - units.keys())
+    return Plan(users, errors, added, removed, files, changed, units, units_changed, units_stale)
 
 
-def validate_compose(settings: Settings, content: str, docker: Docker) -> dict:
-    """`docker compose config` with the new file in place of the generated one; returns the model."""
-    fd, tmp = tempfile.mkstemp(dir=settings.generated_dir, prefix=".compose.users.", suffix=".yaml")
+def validate_units(plan: Plan, engine: Podman) -> None:
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-        target = settings.compose_out.resolve()
-        files = tuple(Path(tmp) if f.resolve() == target else f for f in settings.compose_files)
-        try:
-            return docker.model(files)
-        except DockerError as exc:
-            raise SyncError(f"generated Compose configuration rejected, nothing applied: {exc}") from exc
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+        engine.validate(plan.units)
+    except EngineError as exc:
+        raise SyncError(f"generated units rejected by Podman's Quadlet generator, nothing applied: {exc}") from exc
 
 
-def apply(settings: Settings, plan: Plan, model: dict, docker: Docker) -> list[str]:
-    """Make Docker match the installed files. Returns errors (empty: everything applied)."""
+def apply(settings: Settings, plan: Plan, engine: Podman) -> list[str]:
+    """Make Podman and systemd match the plan. Returns errors (empty: everything applied)."""
     errors: list[str] = []
-    wanted_services = {f"{BROWSER_PREFIX}{u.uid}" for u in plan.users}
-    model_services = set(model.get("services", {}))
-    model_networks = set(model.get("networks", {}))
+    wanted = {u.uid for u in plan.users}
+    qdir = settings.quadlet_dir
 
-    # 1. Browsers of users who lost access (and any other browser service no longer in the project,
-    #    e.g. Phase 2's browser-test): stop them first, this ends their open streams (plan §17).
-    for cid, service in docker.project_containers():
-        if service.startswith(BROWSER_PREFIX) and service not in model_services:
-            log(f"stop and remove {service} ({cid[:12]})")
-            docker.remove_container(cid)
+    # 1. Browsers of users who lost access: stop them first, this ends their open streams (plan §17).
+    stale_uids = sorted({unit_uid(n) for n in plan.units_stale} - wanted)
+    if stale_uids:
+        for uid in stale_uids:
+            log(f"stop {BROWSER_PREFIX}{uid}")
+        engine.stop([u for uid in stale_uids for u in (rb_units.browser_unit(uid), rb_units.network_unit(uid))])
 
-    # 2. Routes. The map is already installed; test it before reloading.
-    nginx = docker.running_nginx()
-    if nginx is None:
-        errors.append("nginx is not running: start the stack (docker compose up -d), then run the sync again")
+    # 2. Units. Removing a unit file never deletes the network itself (step 6) or the profile.
+    if plan.units_changed or plan.units_stale:
+        qdir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        for name in plan.units_changed:
+            atomic_write(qdir / name, plan.units[name])
+            log(f"wrote {qdir / name}")
+        for name in plan.units_stale:
+            (qdir / name).unlink(missing_ok=True)
+            log(f"removed {qdir / name}")
+        engine.daemon_reload()
+
+    # 3. Routes. The map is already installed; test it before reloading.
+    nginx = engine.nginx_running()
+    if not nginx:
+        errors.append(f"{NGINX} is not running: systemctl start {NGINX}, then run the sync again")
     elif read_text(settings.map_loaded_file) != map_hash(settings.map_file):
-        ok, out = docker.nginx_test(nginx)
+        ok, out = engine.nginx_test()
         if ok:
-            docker.nginx_reload(nginx)
+            engine.nginx_reload()
             atomic_write(settings.map_loaded_file, map_hash(settings.map_file))
             log("nginx reloaded")
         else:
@@ -729,36 +656,71 @@ def apply(settings: Settings, plan: Plan, model: dict, docker: Docker) -> list[s
                 settings.map_file.unlink(missing_ok=True)
             errors.append(f"nginx -t failed, previous map restored, routes unchanged: {out}")
 
-    # 3. Browsers: creates networks and containers, applies changed settings (BROWSER_IMAGE).
-    if wanted_services:
-        docker.up(sorted(wanted_services))
+    # 4. Browsers: restart those whose unit changed (a new BROWSER_IMAGE ends their streams), then
+    #    make sure every one runs (starts new ones and their networks; a no-op for running ones).
+    restart = sorted(rb_units.browser_unit(unit_uid(n)) for n in plan.units_changed
+                     if n.endswith(".container") and unit_uid(n) not in plan.added)
+    if restart:
+        engine.try_restart(restart)
+        log(f"restarted {' '.join(restart)}")
+    if wanted:
+        engine.start(sorted(rb_units.browser_unit(uid) for uid in wanted))
 
-    # 4./5. Nginx on exactly the user networks of the project. Only networks this script (or Phase 2)
-    # created are ever removed.
-    networks = [n for n in docker.networks() if n["project"] == settings.project]
-    for n in networks:
-        key = n["key"] or ""
-        if not (key.startswith(NETWORK_PREFIX) or key == PHASE2_NETWORK):
+    # 5./6. Nginx on exactly the user networks. Only networks with the sync's label are ever removed.
+    if nginx:
+        errors += attach(engine, wanted)
+    for n in engine.networks():
+        if n["user"] is None or n["user"] in wanted or not n["name"].startswith(NETWORK_PREFIX):
             continue
-        if key in model_networks:
-            if nginx and nginx not in n["containers"]:
-                docker.connect(n["name"], nginx)
-                log(f"nginx attached to {n['name']}")
-        else:
-            if nginx and nginx in n["containers"]:
-                docker.disconnect(n["name"], nginx)
-            others = [c for c in n["containers"] if c != nginx]
-            if others:
-                errors.append(f"network {n['name']} is no longer used but still has containers; not removed")
-                continue
-            docker.remove_network(n["name"])
-            log(f"removed network {n['name']}")
+        if NGINX in n["containers"]:
+            engine.disconnect(n["name"])
+        if [c for c in n["containers"] if c != NGINX]:
+            errors.append(f"network {n['name']} is no longer used but still has containers; not removed")
+            continue
+        engine.remove_network(n["name"])
+        log(f"removed network {n['name']}")
     return errors
 
 
-def run(settings: Settings, args: argparse.Namespace, docker: Docker | None = None,
+def attach(engine: Podman, uids: set[str]) -> list[str]:
+    """Nginx onto each of these users' networks it is not on yet."""
+    errors = []
+    present = {n["name"]: n for n in engine.networks()}
+    for uid in sorted(uids):
+        name = rb_units.network_name(uid)
+        net = present.get(name)
+        if net is None:
+            errors.append(f"network {name} does not exist (systemctl status {rb_units.network_unit(uid)})")
+        elif NGINX not in net["containers"]:
+            try:
+                engine.connect(name)
+                log(f"nginx attached to {name}")
+            except EngineError as exc:
+                errors.append(f"cannot attach nginx to {name}: {exc}")
+    return errors
+
+
+def attach_only(settings: Settings, engine: Podman) -> int:
+    """After Nginx (re)started: join the networks of the users in state.json. No lock: connecting is
+    idempotent, and waiting for a running sync would hold up Nginx's start."""
+    uids = set(read_state(settings.state_file))
+    if not uids:
+        return 0
+    try:
+        engine.start(sorted(rb_units.network_unit(uid) for uid in uids))
+    except EngineError as exc:
+        warn(f"ERROR: {exc}")
+    errors = attach(engine, uids)
+    for e in errors:
+        warn(f"ERROR: {e}")
+    return 1 if errors else 0
+
+
+def run(settings: Settings, args: argparse.Namespace, engine: Podman | None = None,
         candidates: list[Candidate] | None = None) -> int:
-    docker = docker or Docker(settings)
+    engine = engine or Podman(settings)
+    if getattr(args, "attach_only", False):
+        return attach_only(settings, engine)
     settings.generated_dir.mkdir(parents=True, exist_ok=True)
     settings.nginx_generated_dir.mkdir(parents=True, exist_ok=True)
 
@@ -772,9 +734,9 @@ def run(settings: Settings, args: argparse.Namespace, docker: Docker | None = No
                 raise SyncError(f"{exc}") from exc
 
         try:
-            plan = make_plan(settings, candidates, docker, force=args.force)
-        except DockerError as exc:
-            raise SyncError(f"docker: {exc}") from exc
+            plan = make_plan(settings, candidates, engine, force=args.force)
+        except EngineError as exc:
+            raise SyncError(f"podman: {exc}") from exc
         log(f"{len(plan.users)} user(s): {' '.join(u.uid for u in plan.users) or '-'}")
         if plan.added:
             log(f"added:   {' '.join(plan.added)}")
@@ -784,24 +746,28 @@ def run(settings: Settings, args: argparse.Namespace, docker: Docker | None = No
         if args.dry_run:
             for p in plan.changed:
                 log(f"would write {p}")
+            for n in plan.units_changed:
+                log(f"would write {settings.quadlet_dir / n}")
+            for n in plan.units_stale:
+                log(f"would remove {settings.quadlet_dir / n}")
             log("dry run: nothing changed")
             return 2 if plan.errors else 0
 
-        model = validate_compose(settings, plan.files[settings.compose_out], docker)
+        validate_units(plan, engine)
         if not args.generate_only:
             for u in plan.users:
                 create_user_dir(settings.user_data_root, u)
         for path in plan.changed:
             install(path, plan.files[path])
             log(f"wrote {path}")
-        if not plan.changed:
+        if not plan.changed and not plan.units_changed and not plan.units_stale:
             log("generated files unchanged")
         if args.generate_only:
             return 2 if plan.errors else 0
 
         try:
-            apply_errors = apply(settings, plan, model, docker)
-        except DockerError as exc:
+            apply_errors = apply(settings, plan, engine)
+        except EngineError as exc:
             warn(f"ERROR: applying failed: {exc}")
             return 1
         for e in apply_errors:
@@ -817,7 +783,9 @@ def main(argv: list[str] | None = None) -> int:
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
     mode.add_argument("--generate-only", action="store_true",
-                      help="write the generated files, touch neither Docker nor profile directories")
+                      help="write map and state only; touch neither units, Podman nor profile directories")
+    mode.add_argument("--attach-only", action="store_true",
+                      help="attach Nginx to the networks of the users in state.json (rb-nginx.service)")
     ap.add_argument("--force", action="store_true",
                     help="allow an empty result or more than SYNC_MAX_REMOVALS removals")
     args = ap.parse_args(argv)

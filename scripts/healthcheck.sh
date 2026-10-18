@@ -9,7 +9,7 @@
 # profiles; memory; time since the last successful sync; age of the newest backup; egress filter
 # (root only). Read-only; run as root for the egress and FreeIPA checks.
 #
-# Usage: ./scripts/healthcheck.sh [--quiet]          ENV_FILE=demo/demo.env ./scripts/healthcheck.sh
+# Usage: sudo ./scripts/healthcheck.sh [--quiet]
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,26 +29,29 @@ report() {  # level name detail
     (( quiet && code == 0 )) || printf '%-4s  %s: %s\n' "$level" "$2" "$3"
 }
 
-project="$(env_get COMPOSE_PROJECT_NAME remote-browser)"
 generated="$(env_get GENERATED_DIR ./generated path)"
 user_root="$(env_get USER_DATA_ROOT ./local/users path)"
 backend="$(env_get AUTH_BACKEND freeipa)"
 
-container_health() {  # service -> "status health restarts"
-    local cid; cid="$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=$1" | head -n1)"
-    [[ -n "$cid" ]] || { echo "missing - 0"; return; }
-    docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}} {{.RestartCount}}' "$cid"
+# Restarts come from systemd: every unit start is a new container (podman run --rm --replace), so
+# Podman's own restart count is always 0.
+container_health() {  # container -> "status health restarts" (health "-" without a health check)
+    local out status health
+    out="$(podman container inspect --format '{{.State.Status}}|{{.State.Health.Status}}' "$1" 2>/dev/null)" || out=""
+    [[ -n "$out" ]] || { echo "missing - 0"; return; }
+    IFS='|' read -r status health <<<"$out"
+    echo "$status ${health:--} $(systemctl show -p NRestarts --value "$1.service" 2>/dev/null || echo 0)"
 }
 check_container() {  # service, level when down
     read -r status health restarts <<<"$(container_health "$1")"
     if [[ "$status" != running ]]; then report "$2" "$1" "$status"
     elif [[ "$health" == unhealthy ]]; then report "$2" "$1" "unhealthy"
     elif (( restarts > 3 )); then report WARN "$1" "running, but restarted $restarts times"
-    else report OK "$1" "running${health:+ ($health)}"; fi
+    else report OK "$1" "running ($health)"; fi
 }
 
 # --- containers ---
-check_container nginx CRIT
+check_container rb-nginx CRIT
 users=()
 if [[ -f "$generated/state.json" ]]; then
     mapfile -t users < <(python3 -c 'import json,sys; [print(u) for u in sorted(json.load(open(sys.argv[1]))["users"])]' "$generated/state.json")
@@ -71,9 +74,8 @@ if [[ -n "$authz" ]]; then
     if [[ "$ca_file" == /etc/nginx/authelia-ca/* ]]; then
         curl_ca=(--cacert "$(env_get AUTHELIA_CA_DIR ./local/authelia-ca path)/${ca_file#/etc/nginx/authelia-ca/}")
     fi
-    if [[ "$authz" == http://authelia:* ]]; then  # the demo's Authelia is only on the Docker network
-        out="$(docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=nginx)" \
-            wget -q -O- "$health_url" 2>&1)"
+    if [[ "$authz" == http://authelia:* ]]; then  # Authelia on Nginx's network: ask from there
+        out="$(podman exec rb-nginx wget -q -O- "$health_url" 2>&1)"
     else
         out="$(curl -fsS --max-time 10 "${curl_ca[@]}" "$health_url" 2>&1)"
     fi

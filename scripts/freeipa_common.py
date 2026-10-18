@@ -25,12 +25,12 @@ try:
     import ldap3
     from ldap3.core.exceptions import LDAPException, LDAPNoSuchObjectResult
     from ldap3.utils.dn import parse_dn
-except ImportError:  # reported by connect(); the demo's file source and the unit tests need no LDAP
+except ImportError:  # reported by connect(); the unit tests need no LDAP
     ldap3 = None
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 
-# Lowercase only: the uid becomes part of Compose service, Docker DNS and network names and a
+# Lowercase only: the uid becomes part of container, unit, DNS and network names and a
 # case-sensitive Nginx map key (plan §33).
 UID_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 
@@ -121,7 +121,7 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 
 def _repo_path(value: str) -> Path:
-    """Relative .env paths are relative to the repository, as in compose.yaml bind mounts."""
+    """Relative .env paths are relative to the repository."""
     path = Path(value)
     return path if path.is_absolute() else REPO_DIR / path
 

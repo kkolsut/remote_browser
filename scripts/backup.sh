@@ -7,14 +7,13 @@
 #                        now), without regenerable browser caches
 #     SHA256SUMS, MANIFEST
 #
-# Each user's browser is paused (docker pause) while their profile is archived, so the browsers'
+# Each user's browser is paused (podman pause) while their profile is archived, so the browsers'
 # databases are consistent: an open stream freezes for that time, it does not end. --no-pause skips
 # that (e.g. when Proxmox snapshots are the primary backup). The backup holds secrets and every
 # profile: it is written root-only (0700/0600). Copy it off the VM; PBS snapshots of the VM come first.
 # Keeps the newest BACKUP_KEEP (default 7) backups. Run as root (remote-browser-backup.timer).
 #
-# Usage: ./scripts/backup.sh [--no-pause]
-#        ENV_FILE=demo/demo.env ./scripts/backup.sh
+# Usage: sudo ./scripts/backup.sh [--no-pause]
 # Restore: scripts/restore.sh <backup directory>
 set -euo pipefail
 
@@ -24,7 +23,7 @@ pause=1
 for arg in "$@"; do
     case "$arg" in
         --no-pause) pause=0 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -35,7 +34,6 @@ env_get() {
     [[ "${3:-}" == path && "$v" != /* ]] && v="$repo_dir/${v#./}"
     echo "$v"
 }
-project="$(env_get COMPOSE_PROJECT_NAME remote-browser)"
 user_root="$(env_get USER_DATA_ROOT ./local/users path)"
 backup_root="$(env_get BACKUP_DIR ./local/backups path)"
 keep="$(env_get BACKUP_KEEP 7)"
@@ -44,13 +42,12 @@ keep="$(env_get BACKUP_KEEP 7)"
 # Paths of the configuration archive, relative to the repository when they are inside it.
 config_paths=("$env_file")
 for key in SECRETS_DIR:./local/secrets TLS_DIR:./local/tls FREEIPA_CA_DIR:./local/freeipa-ca \
-           AUTHELIA_CA_DIR:./local/authelia-ca GENERATED_DIR:./generated NGINX_GENERATED_DIR:./nginx/generated \
-           AUTHELIA_DATA_DIR:; do
+           AUTHELIA_CA_DIR:./local/authelia-ca GENERATED_DIR:./generated NGINX_GENERATED_DIR:./nginx/generated; do
     value="$(env_get "${key%%:*}" "${key#*:}")"
     [[ -z "$value" ]] && continue
     [[ "$value" == /* ]] || value="$repo_dir/${value#./}"
     [[ -e "$value" ]] || continue
-    # Only the demo's bundled Authelia data belongs to a container's root; without root, skip it loudly.
+    # Without root, skip what cannot be read, loudly.
     if [[ -n "$(find "$value" ! -readable -print -quit 2>/dev/null)" ]]; then
         echo "WARNING: $value is not fully readable (run as root); not in this backup" >&2
         continue
@@ -93,7 +90,7 @@ printf '  %s\n' "${rel[@]}" "${abs[@]}"
 
 echo "== profiles ($user_root)"
 paused=""
-resume() { [[ -n "$paused" ]] && docker unpause "$paused" >/dev/null 2>&1; paused=""; }
+resume() { [[ -n "$paused" ]] && podman unpause "$paused" >/dev/null 2>&1; paused=""; }
 trap 'resume; rm -rf "$partial"' EXIT
 failed=0
 for dir in "$user_root"/*/; do
@@ -102,9 +99,9 @@ for dir in "$user_root"/*/; do
     [[ "$uid" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "  skip $dir (not a uid)"; continue; }
     cid=""
     if (( pause )); then
-        cid="$(docker ps -q --filter "label=com.docker.compose.project=$project" \
-            --filter "label=com.docker.compose.service=browser-$uid" --filter status=running)"
-        [[ -n "$cid" ]] && docker pause "$cid" >/dev/null && paused="$cid"
+        if [[ "$(podman container inspect --format '{{.State.Status}}' "browser-$uid" 2>/dev/null)" == running ]]; then
+            podman pause "browser-$uid" >/dev/null && paused="browser-$uid" cid="browser-$uid"
+        fi
     fi
     start=$SECONDS
     if tar -C "$user_root" -czf "$partial/users/$uid.tar.gz" --numeric-owner "${excludes[@]}" "$uid"; then

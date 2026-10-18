@@ -1,5 +1,5 @@
 # Rendered by the nginx image entrypoint (envsubst) into /etc/nginx/conf.d/remote-browser.conf.
-# Only variables listed in NGINX_ENVSUBST_FILTER (compose.yaml) are substituted; nginx's own
+# Only variables listed in NGINX_ENVSUBST_FILTER (scripts/install-units.py) are substituted; nginx's own
 # $variables are left untouched.
 #
 # This Nginx sits behind the site's reverse proxy (Apache), which terminates public TLS and forwards
@@ -7,8 +7,8 @@
 
 # Upstreams are referenced through variables (Authelia, the per-user browsers), so Nginx resolves them
 # at request time. NGINX_LOCAL_RESOLVERS comes from the container's /etc/resolv.conf at start (nginx
-# image entrypoint): Docker's embedded DNS 127.0.0.11, or Podman's aardvark-dns on the frontend
-# network's gateway, which also answers for the user networks Nginx is attached to later.
+# image entrypoint): Podman's aardvark-dns on the frontend network's gateway, which also answers for
+# the user networks Nginx is attached to later.
 resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
 # Port part of public https:// URLs: empty on 443.
@@ -114,7 +114,7 @@ server {
         return 200 "Remote browser - identity seen by the backend\n\nremote_user=$http_remote_user\nremote_groups=$http_remote_groups\nremote_name=$http_remote_name\nremote_email=$http_remote_email\nx_remote_user=$http_x_remote_user\n\nLog out: https://${PUBLIC_HOST}$public_port/logout\n";
     }
 
-    # Container healthcheck (compose.yaml). Only reachable inside the container: this server listens on
+    # Container healthcheck (rb-nginx.container). Only reachable inside the container: this server listens on
     # 127.0.0.1, and the public server proxies here only for users without a browser.
     location = /healthz {
         access_log off;

@@ -1,45 +1,36 @@
 #!/usr/bin/env bash
-# Validate the rendered Docker Compose and Nginx configuration (including the generated user map) in
-# throwaway containers.
-# (Authelia is the site's existing instance; validate its configuration there.)
-# Exits non-zero on the first failure. Safe to run while the stack is up.
+# Validate the configuration without changing anything; safe while the service runs:
+#   - Nginx's units from .env through Podman's Quadlet generator, and `nginx -t` with the current
+#     generated user map in a throwaway container (scripts/install-units.py --check);
+#   - the installed per-user units (QUADLET_DIR) through the generator as well.
+# (Authelia is validated by its own deployment: authelia validate-config.)
+# Exits non-zero on the first failure.
 #
-# Usage: ./scripts/validate-config.sh        ENV_FILE=demo/demo.env ./scripts/validate-config.sh
+# Usage: sudo ./scripts/validate-config.sh
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+env_file="${ENV_FILE:-$repo_dir/.env}"
 
-# The files docker compose uses: COMPOSE_FILE from .env (compose.yaml + the generated browsers),
-# otherwise compose.yaml alone.
-env_file="${ENV_FILE:-.env}"
-files="$(grep -E '^COMPOSE_FILE=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
-compose_files=()
-IFS=: read -ra listed <<<"${files:-compose.yaml}"
-for f in "${listed[@]}"; do
-    if [[ -f "$f" ]]; then
-        compose_files+=(-f "$f")
-    elif [[ "$(basename "$f")" == compose.users.yaml ]]; then
-        echo "note: $f not generated yet (first sync), validating without browsers"
-    else
-        echo "$f (COMPOSE_FILE) is missing" >&2; exit 1
-    fi
-done
-dc() { docker compose --env-file "$env_file" "${compose_files[@]}" "$@"; }
+"$repo_dir/scripts/install-units.py" --env-file "$env_file" --check
 
-echo "== docker compose config (${compose_files[*]})"
-dc config --quiet
-
-echo "== seccomp profile"
-python3 -c 'import json, sys; p = json.load(open(sys.argv[1])); assert p["defaultAction"] == "SCMP_ACT_ERRNO"' \
-    browser-image/seccomp-chrome.json
-
-echo "== nginx -t"
-# The image entrypoint renders templates first because the command starts with "nginx".
-# Upstreams are referenced through variables, so this needs neither Authelia nor the browsers.
-if ! out="$(dc run --rm --no-deps -T nginx nginx -t 2>&1)"; then
-    echo "$out" >&2
-    exit 1
-fi
-echo "$out" | grep -E 'nginx: ' || true
+echo "== installed user units"
+python3 - "$repo_dir" "$env_file" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, f"{sys.argv[1]}/scripts")
+import rb_units
+from freeipa_common import read_env_file
+qdir = Path(read_env_file(Path(sys.argv[2])).get("QUADLET_DIR") or rb_units.QUADLET_DIR)
+units = {p.name: p.read_text() for p in sorted(qdir.glob("*")) if p.suffix in (".container", ".network")}
+if not units:
+    print(f"none in {qdir} (first sync not run yet)")
+    sys.exit(0)
+try:
+    rb_units.validate(units)
+except rb_units.UnitError as exc:
+    sys.exit(f"rejected: {exc}")
+print(f"{len(units)} unit(s) in {qdir} ok")
+PY
 
 echo "OK"
